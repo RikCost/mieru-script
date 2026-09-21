@@ -33,7 +33,7 @@
 set -uo pipefail
 
 APP_NAME="mieru-manager"
-APP_VERSION="2.0.1"
+APP_VERSION="2.1.0"
 REPO_RAW="${MIERU_REPO_RAW:-https://raw.githubusercontent.com/RikCost/mieru-script/main}"
 GITHUB_REPO="enfein/mieru"
 
@@ -229,10 +229,98 @@ generate_server_config() {
     fi
 }
 
+# jq-выражение: вычисляет эффективный набор портов пользователя $name.
+# Если у пользователя нет своего списка (.ports) — берутся все порты сервера.
+# Результат — массив объектов портов в переменной $final.
+USER_PORTS_JQ='
+  (.users[] | select(.name == $name)) as $usr
+  | (.ports // []) as $allPorts
+  | ( if (($usr.ports // []) | length) > 0 then $usr.ports else $allPorts end ) as $wanted
+  | [ $wanted[] as $w
+      | select(any($allPorts[];
+          .protocol == $w.protocol
+          and ( (($w.port // null) != null and (.port == $w.port))
+                or (($w.portRange // null) != null and (.portRange == $w.portRange)) )))
+      | $w ] as $sel
+  | ( if ($sel | length) > 0 then $sel else $allPorts end ) as $final
+'
+
+global_ports_list() { state_get -r '.ports[] | "\(.port // .portRange)\t\(.protocol)"'; }
+
+user_ports_tsv() { # <user> -> построчно "<порт>\t<протокол>" (эффективные порты)
+    state_get -r --arg name "$1" "$USER_PORTS_JQ"' | $final[] | "\(.port // .portRange)\t\(.protocol)"'
+}
+
+# Разбор селектора портов: "all" | "1,3" | "443/tcp,2012-2022/udp" -> JSON-массив. [] = все.
+select_ports_from_arg() {
+    local arg="${1:-}" items=() sel=() i p t tok sp pr found
+    mapfile -t items < <(global_ports_list)
+    if [[ -z "$arg" || "$arg" == "all" || "$arg" == "*" ]]; then printf '[]'; return 0; fi
+    local oldifs="$IFS"
+    IFS=','
+    for tok in $arg; do
+        IFS="$oldifs"
+        tok="${tok// /}"
+        [[ -z "$tok" ]] && continue
+        if [[ "$tok" =~ ^[0-9]+$ ]]; then
+            if (( tok >= 1 && tok <= ${#items[@]} )); then
+                sel+=("$((tok-1))")
+            else
+                warn "Нет порта с номером $tok"
+            fi
+            continue
+        fi
+        sp="$tok"; pr="tcp"
+        if [[ "$tok" == */* ]]; then sp="${tok%/*}"; pr="${tok##*/}"; fi
+        pr="$(printf '%s' "$pr" | tr 'a-z' 'A-Z')"
+        found=0
+        for i in "${!items[@]}"; do
+            IFS=$'\t' read -r p t <<<"${items[$i]}"
+            if [[ "$p" == "$sp" && "$t" == "$pr" ]]; then sel+=("$i"); found=1; break; fi
+        done
+        (( found )) || warn "Порт $sp/$pr не найден среди портов сервера"
+    done
+    IFS="$oldifs"
+    if (( ${#sel[@]} == 0 )); then printf '[]'; return 0; fi
+    local idx_json="[$(printf '%s,' "${sel[@]}" | sed 's/,$//')]"
+    state_get --argjson idx "$idx_json" '.ports as $all | [ $idx[] | $all[.] ]'
+}
+
+choose_ports_interactive() { # -> JSON-массив портов пользователя ([] = все)
+    local items=() i p t ans
+    mapfile -t items < <(global_ports_list)
+    if (( ${#items[@]} <= 1 )); then printf '[]'; return 0; fi
+    echo >&2
+    echo "  Порты сервера — какие включить в ссылку этого пользователя:" >&2
+    for i in "${!items[@]}"; do
+        IFS=$'\t' read -r p t <<<"${items[$i]}"
+        printf '   %2d) %s %s\n' "$((i+1))" "$p" "$t" >&2
+    done
+    ask ans "  Номера через запятую (Enter — все порты): " ""
+    if [[ -z "$ans" ]]; then printf '[]'; return 0; fi
+    select_ports_from_arg "$ans"
+}
+
+# --- Привязка портов пользователя (для ссылок) ---
+users_using_port() { # <spec> <proto> -> имена пользователей через запятую
+    state_get -r --arg v "$1" --arg t "$2" '
+        [ .users[] | select((.ports // []) | length > 0)
+          | select(any(.ports[]; .protocol == $t and ((.port|tostring) == $v or .portRange == $v)))
+          | .name ] | join(", ")'
+}
+
+prune_user_ports() { # <spec> <proto> — убрать порт из списков пользователей
+    state_update --arg v "$1" --arg t "$2" '
+        .users |= map(
+          if ((.ports // []) | length) > 0 then
+            (.ports |= map(select(.protocol != $t or ((.port|tostring) != $v and .portRange != $v))))
+            | (if (.ports | length) == 0 then del(.ports) else . end)
+          else . end)' || true
+}
+
 build_client_config() { # build_client_config <user> -> JSON в stdout
     local u="$1"
-    jq --arg name "$u" '
-        (.users[] | select(.name == $name)) as $usr
+    jq --arg name "$u" "$USER_PORTS_JQ"'
         | {
             profiles: [ {
                 profileName: $name,
@@ -240,7 +328,7 @@ build_client_config() { # build_client_config <user> -> JSON в stdout
                 servers: [ {
                     ipAddress: .serverAddress,
                     domainName: "",
-                    portBindings: [ .ports[] | (if .portRange then { portRange: .portRange, protocol: .protocol } else { port: .port, protocol: .protocol } end) ]
+                    portBindings: [ $final[] | (if .portRange then { portRange: .portRange, protocol: .protocol } else { port: .port, protocol: .protocol } end) ]
                 } ],
                 mtu: .mtu,
                 multiplexing: { level: .multiplexing },
@@ -258,7 +346,7 @@ build_client_config() { # build_client_config <user> -> JSON в stdout
 
 build_simple_link() { # build_simple_link <user> -> mierus://...
     local u="$1" pw ip host enc_u enc_p q="" p proto
-    pw="$(state_get -r --arg n "$u" '.users[] | select(.name == $n) | .password')"
+    pw="$(state_get -r --arg name "$u" '.users[] | select(.name == $name) | .password')"
     ip="$(state_get -r '.serverAddress')"
     [[ "$ip" == *:* ]] && host="[$ip]" || host="$ip"
 
@@ -273,7 +361,7 @@ build_simple_link() { # build_simple_link <user> -> mierus://...
         p="${p%$'\r'}"; proto="${proto%$'\r'}"
         [[ -z "$p" ]] && continue
         q+="&port=${p}&protocol=${proto}"
-    done < <(state_get -r '.ports[] | "\(.port // .portRange)\t\(.protocol)"')
+    done < <(user_ports_tsv "$u")
 
     printf 'mierus://%s:%s@%s?%s\n' "$enc_u" "$enc_p" "$host" "$q"
 }
@@ -542,7 +630,7 @@ firewall_deny_port() {
 valid_user_name() { [[ "$1" =~ ^[A-Za-z0-9_.@-]{1,64}$ ]]; }
 
 op_add_user_interactive() {
-    local name pw pw2
+    local name pw pw2 ports_json
     echo
     hr
     printf '%s              ДОБАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯ%s\n' "$C_BLD" "$C_RST"
@@ -572,8 +660,14 @@ op_add_user_interactive() {
     fi
     if (( ${#pw} > 64 )); then err "Пароль длиннее 64 байт — mita его не примет."; return 1; fi
 
-    state_update --arg n "$name" --arg p "$pw" \
-        '.users += [{name:$n, password:$p}]' || { err "Не удалось сохранить состояние."; return 1; }
+    ports_json="$(choose_ports_interactive)"
+    if [[ "$ports_json" == "[]" ]]; then
+        state_update --arg n "$name" --arg p "$pw" \
+            '.users += [{name:$n, password:$p}]' || { err "Не удалось сохранить состояние."; return 1; }
+    else
+        state_update --arg n "$name" --arg p "$pw" --argjson ports "$ports_json" \
+            '.users += [{name:$n, password:$p, ports:$ports}]' || { err "Не удалось сохранить состояние."; return 1; }
+    fi
     state_touch
 
     if ! mita_soft_apply; then
@@ -667,12 +761,14 @@ op_list_users() {
     if (( ${#names[@]} == 0 )); then
         warn "Пользователей нет."
     else
-        local n p
-        printf '  %-24s %-26s %s\n' "ИМЯ" "ПАРОЛЬ" "ФАЙЛ"
+        local n p fp
+        printf '  %-18s %-22s %-26s %s\n' "ИМЯ" "ПАРОЛЬ" "ПОРТЫ (в ссылке)" "ФАЙЛ"
         hr
         for n in "${names[@]}"; do
-            p="$(state_get -r --arg n "$n" '.users[] | select(.name == $n) | .password')"
-            printf '  %-24s %-26s %s\n' "$n" "$p" "$(sanitize_filename "$n").txt"
+            p="$(state_get -r --arg name "$n" '.users[] | select(.name == $name) | .password')"
+            fp="$(user_ports_tsv "$n" | awk '{printf "%s/%s ", $1, $2}')"
+            [[ -z "$fp" ]] && fp="все"
+            printf '  %-18s %-22s %-26s %s\n' "$n" "$p" "$fp" "$(sanitize_filename "$n").txt"
         done
     fi
     hr
@@ -773,9 +869,44 @@ op_delete_port_interactive() {
     remove_port_from_state "$p" "$t" || return 1
     state_touch
     firewall_deny_port "$p" "$t"
+    local affected; affected="$(users_using_port "$p" "$t")"
+    prune_user_ports "$p" "$t"
+    if [[ -n "$affected" ]]; then
+        warn "Порт ${p}/${t} убран из ссылок пользователей: $affected"
+        warn "(если у кого-то не осталось портов — снова включены все порты сервера)"
+    fi
     if ! try_hard_apply; then warn "Не удалось перезапустить mita."; return 1; fi
     info "Порт ${p}/${t} удалён, mita перезапущен."
     regenerate_all_links
+}
+
+op_set_user_ports_interactive() { # какие порты попадят в ссылку пользователя
+    local names=() i name choice ports_json
+    mapfile -t names < <(state_get -r '.users[].name' 2>/dev/null)
+    if (( ${#names[@]} == 0 )); then warn "Пользователей нет."; return 0; fi
+
+    echo
+    hr
+    printf '%s           ПОРТЫ ПОЛЬЗОВАТЕЛЯ (для ссылки)%s\n' "$C_BLD" "$C_RST"
+    hr
+    for i in "${!names[@]}"; do printf '  %2d) %s\n' "$((i+1))" "${names[$i]}"; done
+    echo
+    ask choice "Номер пользователя (0 — отмена): " "0"
+    [[ "$choice" =~ ^[0-9]+$ ]] || { warn "Неверный ввод."; return 1; }
+    (( choice >= 1 && choice <= ${#names[@]} )) || { info "Отменено."; return 0; }
+    name="${names[$((choice-1))]}"
+
+    ports_json="$(choose_ports_interactive)"
+    if [[ "$ports_json" == "[]" ]]; then
+        state_update --arg name "$name" '.users |= map(if .name == $name then del(.ports) else . end)' || return 1
+        info "Пользователю '$name' назначены ВСЕ порты."
+    else
+        state_update --arg name "$name" --argjson ports "$ports_json" \
+            '.users |= map(if .name == $name then .ports = $ports else . end)' || return 1
+        info "Пользователю '$name' назначены выбранные порты."
+    fi
+    state_touch
+    save_user_links "$name" >/dev/null && info "Ссылка обновлена: $CLIENTS_DIR/$(sanitize_filename "$name").txt"
 }
 
 op_list_ports() {
@@ -1200,6 +1331,7 @@ print_menu_items() {
   8.  Ссылка пользователя           16.  Логи
                                     17.  Показать конфигурацию
   0.  Выход                         18.  Обновить mieru-manager
+ 19.  Порты пользователя (что попадёт в ссылку)
 EOF
 }
 
@@ -1237,7 +1369,7 @@ menu() {
         print_menu_items
         echo
         local choice u
-        ask choice "  Действие [0-18, ? — список, 0 — выход]: " "0"
+        ask choice "  Действие [0-19, ? — список, 0 — выход]: " "0"
         case "$choice" in
             "?"|h|H|help) continue ;;
             1)  op_add_user_interactive; pause ;;
@@ -1258,6 +1390,7 @@ menu() {
             16) op_logs; pause ;;
             17) op_show_config; pause ;;
             18) op_self_update; pause ;;
+            19) op_set_user_ports_interactive; pause ;;
             0|q|Q) info "До выхода!"; exit 0 ;;
             *)  warn "Неверный выбор."; sleep 1 ;;
         esac
@@ -1281,8 +1414,9 @@ ${APP_NAME} v${APP_VERSION} — управление прокси-серверо
   menu                        Интерактивное меню
   status                      Статус сервера, службы и трафика
   list-users                  Список пользователей
-  add-user <имя> [пароль]     Добавить пользователя (пароль можно не указывать)
+  add-user <имя> [пароль] [порты]     Порты: "all", номера "1,3" или "443/tcp,2012-2022/udp"
   delete-user <имя>           Удалить пользователя
+  set-user-ports <имя> <порты>  Какие порты включать в ссылку (all | 1,3 | 443/tcp)
   passwd <имя> [пароль]       Сменить пароль
   list-ports                  Список портов
   add-port <порт|диапазон> <tcp|udp|both>   Добавить порт (443 или 2012-2022)
@@ -1309,14 +1443,20 @@ EOF
 }
 
 cmd_add_user_cli() {
-    local name="${1:-}" pw="${2:-}"
-    [[ -n "$name" ]] || die "Укажите имя: add-user <имя> [пароль]"
+    local name="${1:-}" pw="${2:-}" ports_sel="${3:-}"
+    [[ -n "$name" ]] || die "Укажите имя: add-user <имя> [пароль] [порты]"
     valid_user_name "$name" || die "Недопустимое имя пользователя."
     state_get -e --arg n "$name" '.users[] | select(.name == $n)' 2>/dev/null | grep -q . \
         && die "Пользователь '$name' уже существует."
     [[ -z "$pw" ]] && pw="$(gen_password)"
     (( ${#pw} <= 64 )) || die "Пароль длиннее 64 байт."
-    state_update --arg n "$name" --arg p "$pw" '.users += [{name:$n, password:$p}]' || die "Ошибка сохранения."
+    local ports_json; ports_json="$(select_ports_from_arg "$ports_sel")"
+    if [[ "$ports_json" == "[]" ]]; then
+        state_update --arg n "$name" --arg p "$pw" '.users += [{name:$n, password:$p}]' || die "Ошибка сохранения."
+    else
+        state_update --arg n "$name" --arg p "$pw" --argjson ports "$ports_json" \
+            '.users += [{name:$n, password:$p, ports:$ports}]' || die "Ошибка сохранения."
+    fi
     state_touch
     mita_soft_apply || die "Не удалось применить конфигурацию."
     info "Пользователь '$name' добавлен. Пароль: $pw"
@@ -1335,6 +1475,23 @@ cmd_delete_user_cli() {
     mita_proxy_running && mita reload >/dev/null 2>&1 || true
     rm -f "$CLIENTS_DIR/$(sanitize_filename "$name").txt" "$CLIENTS_DIR/$(sanitize_filename "$name").json"
     info "Пользователь '$name' удалён."
+}
+
+cmd_set_user_ports_cli() {
+    local name="${1:-}" sel="${2:-all}"
+    [[ -n "$name" ]] || die "Укажите имя: set-user-ports <имя> <all|1,3|443/tcp,2012-2022/udp>"
+    state_get -e --arg name "$name" '.users[] | select(.name == $name)' 2>/dev/null | grep -q . \
+        || die "Пользователь '$name' не найден."
+    local ports_json; ports_json="$(select_ports_from_arg "$sel")"
+    if [[ "$ports_json" == "[]" ]]; then
+        state_update --arg name "$name" '.users |= map(if .name == $name then del(.ports) else . end)' || die "Ошибка сохранения."
+    else
+        state_update --arg name "$name" --argjson ports "$ports_json" \
+            '.users |= map(if .name == $name then .ports = $ports else . end)' || die "Ошибка сохранения."
+    fi
+    state_touch
+    save_user_links "$name" >/dev/null
+    info "Порты пользователя '$name' обновлены: $sel"
 }
 
 cmd_passwd_cli() {
@@ -1387,6 +1544,9 @@ cmd_delete_port_cli() {
         [[ -z "$t" ]] && continue
         remove_port_from_state "$spec" "$t" || die "Ошибка."
         firewall_deny_port "$spec" "$t"
+        local affected; affected="$(users_using_port "$spec" "$t")"
+        prune_user_ports "$spec" "$t"
+        [[ -n "$affected" ]] && warn "Порт ${spec}/${t} убран из ссылок: $affected"
     done <<<"$items"
     state_touch
     try_hard_apply || die "Не удалось перезапустить mita."
@@ -1416,6 +1576,7 @@ main() {
         list-users)   require_root; op_list_users ;;
         add-user)     require_root; shift; cmd_add_user_cli "$@" ;;
         delete-user)  require_root; shift; cmd_delete_user_cli "$@" ;;
+        set-user-ports) require_root; shift; cmd_set_user_ports_cli "$@" ;;
         passwd)       require_root; shift; cmd_passwd_cli "$@" ;;
         list-ports)   require_root; op_list_ports ;;
         add-port)     require_root; shift; cmd_add_port_cli "$@" ;;
