@@ -41,23 +41,37 @@ fi
 printf '[+] Скачиваю mieru-manager...\n'
 TMP="$(mktemp)"
 
-# Несколько зеркал на случай, если raw.githubusercontent.com недоступен с VPS.
-MIRRORS=(
-    "$REPO_RAW/mieru-manager.sh"
-    "https://cdn.jsdelivr.net/gh/RikCost/mieru-script@main/mieru-manager.sh"
-    "https://raw.githack.com/RikCost/mieru-script/main/mieru-manager.sh"
-    "https://github.com/RikCost/mieru-script/raw/main/mieru-manager.sh"
-)
-OK=0
-for url in "${MIRRORS[@]}"; do
-    printf '    пробую: %s\n' "$url"
-    if curl -fsSL --retry 2 --connect-timeout 15 --max-time 180 -o "$TMP" "$url" && [[ -s "$TMP" ]]; then
-        OK=1
-        break
+# raw.githubusercontent.com кэширует ветку до ~5 минут и может отдать СТАРУЮ
+# версию. Поэтому сначала берём SHA последнего коммита main и качаем файл по
+# неизменяемой ссылке на этот коммит (кэш невозможен). Зеркала — как fallback.
+fetch_manager() { # $1 = путь назначения
+    local out="$1" sha ts url
+    ts="$(date +%s)"
+    sha="$(curl -fsSL --connect-timeout 10 --max-time 30 \
+            "https://api.github.com/repos/RikCost/mieru-script/commits/main" 2>/dev/null \
+            | grep -oE '"sha": *"[0-9a-f]{40}"' | head -n1 | grep -oE '[0-9a-f]{40}')"
+    local urls=()
+    if [[ -n "$sha" ]]; then
+        printf '    коммит main: %s\n' "${sha:0:12}"
+        urls+=("https://raw.githubusercontent.com/RikCost/mieru-script/${sha}/mieru-manager.sh")
     fi
-done
-if [[ "$OK" -ne 1 ]]; then
-    printf '[-] Не удалось скачать mieru-manager ни с одного зеркала.\n' >&2
+    urls+=(
+        "https://cdn.jsdelivr.net/gh/RikCost/mieru-script@main/mieru-manager.sh"
+        "https://raw.githack.com/RikCost/mieru-script/main/mieru-manager.sh"
+        "$REPO_RAW/mieru-manager.sh?t=${ts}"
+        "https://github.com/RikCost/mieru-script/raw/main/mieru-manager.sh?t=${ts}"
+    )
+    for url in "${urls[@]}"; do
+        printf '    пробую: %s\n' "$url"
+        if curl -fsSL --retry 2 --connect-timeout 15 --max-time 180 -o "$out" "$url" && [[ -s "$out" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+if ! fetch_manager "$TMP"; then
+    printf '[-] Не удалось скачать mieru-manager ни с одного источника.\n' >&2
     printf '    Проверьте доступ к GitHub с сервера.\n' >&2
     exit 1
 fi

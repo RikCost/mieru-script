@@ -33,7 +33,7 @@
 set -uo pipefail
 
 APP_NAME="mieru-manager"
-APP_VERSION="2.0.0"
+APP_VERSION="2.0.1"
 REPO_RAW="${MIERU_REPO_RAW:-https://raw.githubusercontent.com/RikCost/mieru-script/main}"
 GITHUB_REPO="enfein/mieru"
 
@@ -1013,11 +1013,24 @@ op_restart() {
 }
 
 op_self_update() {
-    local tmp url ok=0
+    local tmp sha ts url ok=0 ver
     tmp="$(mktemp)"
-    for url in "$REPO_RAW/mieru-manager.sh" \
-               "https://cdn.jsdelivr.net/gh/RikCost/mieru-script@main/mieru-manager.sh" \
-               "https://raw.githack.com/RikCost/mieru-script/main/mieru-manager.sh"; do
+    ts="$(date +%s)"
+    # SHA последнего коммита main — raw по нему никогда не отдаёт кэш
+    sha="$(curl -fsSL --connect-timeout 10 --max-time 30 \
+            "https://api.github.com/repos/RikCost/mieru-script/commits/main" 2>/dev/null \
+            | grep -oE '"sha": *"[0-9a-f]{40}"' | head -n1 | grep -oE '[0-9a-f]{40}')"
+    local urls=()
+    if [[ -n "$sha" ]]; then
+        info "Последний коммит main: ${sha:0:12}"
+        urls+=("https://raw.githubusercontent.com/RikCost/mieru-script/${sha}/mieru-manager.sh")
+    fi
+    urls+=(
+        "https://cdn.jsdelivr.net/gh/RikCost/mieru-script@main/mieru-manager.sh"
+        "https://raw.githack.com/RikCost/mieru-script/main/mieru-manager.sh"
+        "$REPO_RAW/mieru-manager.sh?t=${ts}"
+    )
+    for url in "${urls[@]}"; do
         if curl -fsSL --retry 2 --connect-timeout 15 --max-time 120 -o "$tmp" "$url" && [[ -s "$tmp" ]]; then
             ok=1; break
         fi
@@ -1026,8 +1039,9 @@ op_self_update() {
         install -m 0755 "$tmp" /usr/local/bin/mieru-manager 2>/dev/null \
             || cp "$tmp" /usr/local/bin/mieru-manager
         chmod 0755 /usr/local/bin/mieru-manager 2>/dev/null || true
+        ver="$(grep -m1 '^APP_VERSION=' /usr/local/bin/mieru-manager | cut -d'"' -f2)"
         rm -f "$tmp"
-        info "mieru-manager обновлён. Перезапустите его."
+        info "mieru-manager обновлён до версии ${ver:-?}. Перезапустите его."
     else
         rm -f "$tmp"
         err "Не удалось скачать обновление."

@@ -9,7 +9,7 @@ RHEL / Fedora / CentOS.
 скрипт делает сам.
 
 ```
-curl -fsSL https://raw.githubusercontent.com/RikCost/mieru-script/main/install.sh | bash
+curl -fsSL https://cdn.jsdelivr.net/gh/RikCost/mieru-script@main/install.sh | bash
 ```
 
 После установки управление доступно командой `mieru-manager`.
@@ -43,14 +43,17 @@ curl -fsSL https://raw.githubusercontent.com/RikCost/mieru-script/main/install.s
 На VPS от root:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/RikCost/mieru-script/main/install.sh | bash
+curl -fsSL https://cdn.jsdelivr.net/gh/RikCost/mieru-script@main/install.sh | bash
 ```
 
-Если `raw.githubusercontent.com` с вашего VPS недоступен (частая проблема),
-используйте зеркало:
+> `raw.githubusercontent.com` может отдавать из кэша устаревший файл (до ~5 минут).
+> Установщик и `mieru-manager self-update` сами берут свежую версию по SHA коммита,
+> но сам `install.sh` лучше тянуть с jsDelivr.
+
+Альтернатива через raw:
 
 ```bash
-curl -fsSL https://cdn.jsdelivr.net/gh/RikCost/mieru-script@main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/RikCost/mieru-script/main/install.sh | bash
 ```
 
 Или скачайте и запустите вручную, чтобы видеть все сообщения:
@@ -121,6 +124,7 @@ mieru-manager backup                           # резервная копия
 mieru-manager restore /root/mieru/backups/...  # восстановить
 mieru-manager update                           # обновить mita
 mieru-manager self-update                      # обновить mieru-manager
+mieru-manager self-check                       # диагностика (tty, вывод)
 mieru-manager logs                             # журнал mita
 ```
 
