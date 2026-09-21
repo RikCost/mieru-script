@@ -108,8 +108,10 @@ mieru-manager add-user ivan 'МойПароль'        # добавить с п
 mieru-manager delete-user ivan                 # удалить
 mieru-manager passwd ivan                      # сменить пароль
 mieru-manager list-ports                       # список портов
-mieru-manager add-port 443 both                # tcp|udp|both
-mieru-manager delete-port 2053                 # удалить порт
+mieru-manager add-port 443 both               # порт (tcp|udp|both)
+mieru-manager add-port 2012-2022 both         # диапазон портов
+mieru-manager delete-port 2053                # удалить порт
+mieru-manager delete-port 2012-2022           # удалить диапазон
 mieru-manager links                            # все ссылки
 mieru-manager links ivan                       # ссылки одного пользователя
 mieru-manager qr ivan                          # QR-код
@@ -153,7 +155,9 @@ mieru-manager logs                             # журнал mita
   `mita apply config <file>`, изменения только пользователей применяются
   `mita reload`, изменение портов требует перезапуска (`mita stop` + `mita start`).
 - `portBindings` при применении **заменяются** целиком, поэтому порты всегда
-  синхронизируются с `state.json`.
+  синхронизируются с `state.json`. Поддерживаются как отдельные порты, так и
+  диапазоны (`"portRange": "2012-2022"`) — в меню и CLI можно вводить
+  `2012-2022`.
 - `users` **мержатся по имени**, поэтому смена пароля — это повторное
   применение того же имени, а удаление делается командой `mita delete user`.
 - Ссылки генерирует настоящий клиент `mieru` в изолированном временном
@@ -184,7 +188,18 @@ proxies:
     username: ivan
     password: "МойПароль"
     multiplexing: MULTIPLEXING_HIGH
+  - name: server2
+    type: mieru
+    server: 203.0.113.10
+    port-range: 2012-2022
+    transport: TCP
+    udp: true
+    username: ivan
+    password: "МойПароль"
+    multiplexing: MULTIPLEXING_HIGH
 ```
+
+> В одной записи нельзя указывать одновременно `port` и `port-range`.
 
 ---
 

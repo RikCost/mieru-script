@@ -215,7 +215,7 @@ generate_server_config() {
     local tmp
     tmp="$(mktemp "$BASE_DIR/.server.XXXXXX")" || return 1
     if jq '{
-            portBindings: [ .ports[]  | { port: .port, protocol: .protocol } ],
+            portBindings: [ .ports[] | (if .portRange then { portRange: .portRange, protocol: .protocol } else { port: .port, protocol: .protocol } end) ],
             users:        [ .users[]  | { name: .name, password: .password } ],
             loggingLevel: .loggingLevel,
             mtu:          .mtu,
@@ -240,7 +240,7 @@ build_client_config() { # build_client_config <user> -> JSON в stdout
                 servers: [ {
                     ipAddress: .serverAddress,
                     domainName: "",
-                    portBindings: [ .ports[] | { port: .port, protocol: .protocol } ]
+                    portBindings: [ .ports[] | (if .portRange then { portRange: .portRange, protocol: .protocol } else { port: .port, protocol: .protocol } end) ]
                 } ],
                 mtu: .mtu,
                 multiplexing: { level: .multiplexing },
@@ -273,7 +273,7 @@ build_simple_link() { # build_simple_link <user> -> mierus://...
         p="${p%$'\r'}"; proto="${proto%$'\r'}"
         [[ -z "$p" ]] && continue
         q+="&port=${p}&protocol=${proto}"
-    done < <(state_get -r '.ports[] | "\(.port)\t\(.protocol)"')
+    done < <(state_get -r '.ports[] | "\(.port // .portRange)\t\(.protocol)"')
 
     printf 'mierus://%s:%s@%s?%s\n' "$enc_u" "$enc_p" "$host" "$q"
 }
@@ -511,25 +511,27 @@ regenerate_all_links() {
 # Firewall
 # ---------------------------------------------------------------------------
 firewall_allow_port() {
-    local port="$1" proto="$2" lp
+    local spec="$1" proto="$2" lp ufw_spec
     lp="$(printf '%s' "$proto" | tr 'A-Z' 'a-z')"
+    if [[ "$spec" == *-* ]]; then ufw_spec="${spec/-/:}"; else ufw_spec="$spec"; fi
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow "${port}/${lp}" >/dev/null 2>&1 || true
+        ufw allow "${ufw_spec}/${lp}" >/dev/null 2>&1 || true
     fi
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
-        firewall-cmd --permanent --add-port="${port}/${lp}" >/dev/null 2>&1 || true
+        firewall-cmd --permanent --add-port="${spec}/${lp}" >/dev/null 2>&1 || true
         firewall-cmd --reload >/dev/null 2>&1 || true
     fi
 }
 
 firewall_deny_port() {
-    local port="$1" proto="$2" lp
+    local spec="$1" proto="$2" lp ufw_spec
     lp="$(printf '%s' "$proto" | tr 'A-Z' 'a-z')"
+    if [[ "$spec" == *-* ]]; then ufw_spec="${spec/-/:}"; else ufw_spec="$spec"; fi
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw delete allow "${port}/${lp}" >/dev/null 2>&1 || true
+        ufw delete allow "${ufw_spec}/${lp}" >/dev/null 2>&1 || true
     fi
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
-        firewall-cmd --permanent --remove-port="${port}/${lp}" >/dev/null 2>&1 || true
+        firewall-cmd --permanent --remove-port="${spec}/${lp}" >/dev/null 2>&1 || true
         firewall-cmd --reload >/dev/null 2>&1 || true
     fi
 }
@@ -682,16 +684,42 @@ op_list_users() {
 # ---------------------------------------------------------------------------
 # Операции: порты
 # ---------------------------------------------------------------------------
-valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
+valid_port_num() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+valid_port_spec() {
+    local s="$1" a b
+    valid_port_num "$s" && return 0
+    if [[ "$s" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]]; then
+        a="${BASH_REMATCH[1]}"; b="${BASH_REMATCH[2]}"
+        valid_port_num "$a" && valid_port_num "$b" && (( 10#$a <= 10#$b )) && return 0
+    fi
+    return 1
+}
+is_port_range() { [[ "$1" == *-* ]]; }
+
+# $1 = спецификация (443 или 2012-2022), $2 = протокол
+port_exists() {
+    state_get -e --arg v "$1" --arg t "$2" \
+        '.ports[] | select(.protocol == $t and ((.port | tostring) == $v or .portRange == $v))' 2>/dev/null | grep -q .
+}
+
+add_port_to_state() {
+    state_update --arg v "$1" --arg t "$2" \
+        'if ($v | test("-")) then .ports += [{portRange:$v, protocol:$t}] else .ports += [{port:($v|tonumber), protocol:$t}] end'
+}
+
+remove_port_from_state() {
+    state_update --arg v "$1" --arg t "$2" \
+        '.ports = [ .ports[] | select(.protocol != $t or (((.port | tostring) != $v) and (.portRange != $v))) ]'
+}
 
 op_add_port_interactive() {
-    local port proto choice
+    local spec proto choice
     echo
     hr
     printf '%s                 ДОБАВЛЕНИЕ ПОРТА%s\n' "$C_BLD" "$C_RST"
     hr
-    ask port "Порт (1-65535): " ""
-    valid_port "$port" || { err "Некорректный порт."; return 1; }
+    ask spec "Порт или диапазон (443 или 2012-2022): " ""
+    valid_port_spec "$spec" || { err "Некорректный порт/диапазон. Пример: 443 или 2012-2022."; return 1; }
     ask choice "Протокол: 1) TCP  2) UDP  3) TCP+UDP  [1]: " "1"
 
     local list=()
@@ -704,15 +732,13 @@ op_add_port_interactive() {
 
     local added=0 p
     for p in "${list[@]}"; do
-        if state_get -e --argjson p "$port" --arg t "$p" \
-            '.ports[] | select(.port == $p and .protocol == $t)' 2>/dev/null | grep -q .; then
-            warn "Порт ${port}/${p} уже добавлен."
+        if port_exists "$spec" "$p"; then
+            warn "Порт ${spec}/${p} уже добавлен."
             continue
         fi
-        state_update --argjson p "$port" --arg t "$p" \
-            '.ports += [{port:$p, protocol:$t}]' || return 1
-        firewall_allow_port "$port" "$p"
-        info "Добавлен ${port}/${p}"
+        add_port_to_state "$spec" "$p" || return 1
+        firewall_allow_port "$spec" "$p"
+        info "Добавлен ${spec}/${p}"
         added=1
     done
     [[ "$added" -eq 0 ]] && return 0
@@ -725,7 +751,7 @@ op_add_port_interactive() {
 
 op_delete_port_interactive() {
     local items=() i p t choice
-    mapfile -t items < <(state_get -r '.ports[] | "\(.port)\t\(.protocol)"' 2>/dev/null)
+    mapfile -t items < <(state_get -r '.ports[] | "\(.port // .portRange)\t\(.protocol)"' 2>/dev/null)
     if (( ${#items[@]} == 0 )); then warn "Портов нет."; return 0; fi
 
     echo
@@ -744,8 +770,7 @@ op_delete_port_interactive() {
 
     confirm "Удалить порт ${p}/${t}?" || { info "Отменено."; return 0; }
 
-    state_update --argjson p "$p" --arg t "$t" \
-        '.ports = [ .ports[] | select(.port != $p or .protocol != $t) ]' || return 1
+    remove_port_from_state "$p" "$t" || return 1
     state_touch
     firewall_deny_port "$p" "$t"
     if ! try_hard_apply; then warn "Не удалось перезапустить mita."; return 1; fi
@@ -755,7 +780,7 @@ op_delete_port_interactive() {
 
 op_list_ports() {
     local items=()
-    mapfile -t items < <(state_get -r '.ports[] | "\(.port)\t\(.protocol)"' 2>/dev/null)
+    mapfile -t items < <(state_get -r '.ports[] | "\(.port // .portRange)\t\(.protocol)"' 2>/dev/null)
     echo
     hr
     printf '%s                      ПОРТЫ%s\n' "$C_BLD" "$C_RST"
@@ -763,20 +788,21 @@ op_list_ports() {
     if (( ${#items[@]} == 0 )); then
         warn "Портов нет."
     else
-        local i p t state
-        printf '  %-6s %-10s %-8s %s\n' "ID" "ПОРТ" "ПРОТО" "СЛУШАЕТСЯ"
+        local i p t state check
+        printf '  %-6s %-14s %-8s %s\n' "ID" "ПОРТ" "ПРОТО" "СЛУШАЕТСЯ"
         hr
         for i in "${!items[@]}"; do
             IFS=$'\t' read -r p t <<<"${items[$i]}"
+            check="${p%%-*}"
             state="?"
             if command -v ss >/dev/null 2>&1; then
                 if [[ "$t" == "TCP" ]]; then
-                    ss -lntH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}$" && state="да" || state="нет"
+                    ss -lntH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${check}$" && state="да" || state="нет"
                 else
-                    ss -lnuH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}$" && state="да" || state="нет"
+                    ss -lnuH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${check}$" && state="да" || state="нет"
                 fi
             fi
-            printf '  %-6s %-10s %-8s %s\n' "$((i+1))" "$p" "$t" "$state"
+            printf '  %-6s %-14s %-8s %s\n' "$((i+1))" "$p" "$t" "$state"
         done
     fi
     hr
@@ -1020,21 +1046,22 @@ first_run_wizard() {
     echo
 
     # --- порты ---
-    local port proto choice more
+    local spec proto choice
     echo "  Настроим порты, которые будет слушать mita."
+    echo "  Можно указать один порт (443) или диапазон (2012-2022)."
     echo "  Рекомендуется минимум один TCP и один UDP."
     while :; do
-        ask port "  Порт (Enter — 443): " "443"
-        valid_port "$port" || { warn "  Некорректный порт."; continue; }
+        ask spec "  Порт или диапазон (Enter — 443): " "443"
+        valid_port_spec "$spec" || { warn "  Некорректный порт/диапазон."; continue; }
         ask choice "  Протокол: 1) TCP  2) UDP  3) TCP+UDP  [1]: " "1"
         case "$choice" in
-            1|"") state_update --argjson p "$port" '.ports += [{port:$p, protocol:"TCP"}]' && firewall_allow_port "$port" TCP ;;
-            2)     state_update --argjson p "$port" '.ports += [{port:$p, protocol:"UDP"}]' && firewall_allow_port "$port" UDP ;;
-            3)     state_update --argjson p "$port" '.ports += [{port:$p, protocol:"TCP"}]' && firewall_allow_port "$port" TCP
-                   state_update --argjson p "$port" '.ports += [{port:$p, protocol:"UDP"}]' && firewall_allow_port "$port" UDP ;;
+            1|"") add_port_to_state "$spec" TCP && firewall_allow_port "$spec" TCP ;;
+            2)     add_port_to_state "$spec" UDP && firewall_allow_port "$spec" UDP ;;
+            3)     add_port_to_state "$spec" TCP && firewall_allow_port "$spec" TCP
+                   add_port_to_state "$spec" UDP && firewall_allow_port "$spec" UDP ;;
             *)     warn "  Неверный выбор."; continue ;;
         esac
-        info "  Порт $port добавлен."
+        info "  Порт $spec добавлен."
         confirm "  Добавить ещё порт?" || break
     done
 
@@ -1217,8 +1244,8 @@ ${APP_NAME} v${APP_VERSION} — управление прокси-серверо
   delete-user <имя>           Удалить пользователя
   passwd <имя> [пароль]       Сменить пароль
   list-ports                  Список портов
-  add-port <порт> <tcp|udp|both>   Добавить порт
-  delete-port <порт>          Удалить порт
+  add-port <порт|диапазон> <tcp|udp|both>   Добавить порт (443 или 2012-2022)
+  delete-port <порт|диапазон>          Удалить порт (443 или 2012-2022)
   links [имя]                 Показать клиентские ссылки
   qr <имя>                    Показать QR-код
   config                      Показать конфигурацию mita
@@ -1284,8 +1311,8 @@ cmd_passwd_cli() {
 }
 
 cmd_add_port_cli() {
-    local port="${1:-}" proto="${2:-tcp}"
-    valid_port "$port" || die "Укажите порт 1-65535: add-port <порт> <tcp|udp|both>"
+    local spec="${1:-}" proto="${2:-tcp}"
+    valid_port_spec "$spec" || die "Укажите порт или диапазон: add-port <443|2012-2022> <tcp|udp|both>"
     local list=()
     case "$(printf '%s' "$proto" | tr 'A-Z' 'a-z')" in
         tcp)  list=(TCP) ;;
@@ -1295,32 +1322,34 @@ cmd_add_port_cli() {
     esac
     local p
     for p in "${list[@]}"; do
-        state_get -e --argjson pp "$port" --arg t "$p" '.ports[] | select(.port == $pp and .protocol == $t)' 2>/dev/null | grep -q . \
-            && { warn "Порт ${port}/${p} уже есть."; continue; }
-        state_update --argjson pp "$port" --arg t "$p" '.ports += [{port:$pp, protocol:$t}]' || die "Ошибка сохранения."
-        firewall_allow_port "$port" "$p"
+        if port_exists "$spec" "$p"; then
+            warn "Порт ${spec}/${p} уже есть."
+            continue
+        fi
+        add_port_to_state "$spec" "$p" || die "Ошибка сохранения."
+        firewall_allow_port "$spec" "$p"
     done
     state_touch
     try_hard_apply || die "Не удалось перезапустить mita."
     regenerate_all_links
-    info "Порт ${port} (${proto}) добавлен."
+    info "Порт ${spec} (${proto}) добавлен."
 }
 
 cmd_delete_port_cli() {
-    local port="${1:-}"
-    valid_port "$port" || die "Укажите порт: delete-port <порт>"
-    local items; items="$(state_get -r --argjson p "$port" '.ports[] | select(.port == $p) | .protocol')"
-    [[ -z "$items" ]] && die "Порт $port не найден."
+    local spec="${1:-}"
+    valid_port_spec "$spec" || die "Укажите порт или диапазон: delete-port <443|2012-2022>"
+    local items; items="$(state_get -r --arg v "$spec" '.ports[] | select((.port | tostring) == $v or .portRange == $v) | .protocol')"
+    [[ -z "$items" ]] && die "Порт $spec не найден."
     local t
     while IFS= read -r t; do
         [[ -z "$t" ]] && continue
-        state_update --argjson p "$port" --arg tt "$t" '.ports = [ .ports[] | select(.port != $p or .protocol != $tt) ]' || die "Ошибка."
-        firewall_deny_port "$port" "$t"
+        remove_port_from_state "$spec" "$t" || die "Ошибка."
+        firewall_deny_port "$spec" "$t"
     done <<<"$items"
     state_touch
     try_hard_apply || die "Не удалось перезапустить mita."
     regenerate_all_links
-    info "Порт $port удалён."
+    info "Порт $spec удалён."
 }
 
 # ---------------------------------------------------------------------------
