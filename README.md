@@ -1,5 +1,7 @@
 # mieru-script
 
+**Русский** | [English](README.en.md)
+
 Автоматическая установка и управление прокси-сервером **mita** (серверная часть
 [enfein/mieru](https://github.com/enfein/mieru)) на VPS под Debian / Ubuntu /
 RHEL / Fedora / CentOS.
@@ -79,7 +81,7 @@ bash /tmp/install.sh
 
 ```
 ────────────────────────────────────────────────────────────────
-             MIERU MANAGER 2.0.0
+             MIERU MANAGER 2.1.0
 ────────────────────────────────────────────────────────────────
   Сервер:  203.0.113.10
   Mita:    ● RUNNING
