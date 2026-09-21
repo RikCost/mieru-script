@@ -29,7 +29,8 @@ After installation everything is managed with `mieru-manager`.
 - Generates **official** `mieru://` and `mierus://` client links using the real
   `mieru` client (downloaded to `/root/mieru/bin`, does not affect the server).
 - Per-user client configs (`*.json`) and links (`*.txt`).
-- QR code for a link (`qrencode`).
+- QR code for a link (by default from the short `mierus://` — much more reliable
+  to scan; a PNG is also saved to `clients/<name>.png`).
 - Opens/closes ports in `ufw` and `firewalld`.
 - Backup and restore.
 - Update `mita` and `mieru-manager` itself.
@@ -80,7 +81,7 @@ What the script does:
 
 ```
 ────────────────────────────────────────────────────────────────
-             MIERU MANAGER 2.1.0
+             MIERU MANAGER 2.2.0
 ────────────────────────────────────────────────────────────────
   Сервер:  203.0.113.10
   Mita:    ● RUNNING
@@ -130,7 +131,8 @@ mieru-manager delete-port 2053                 # delete a port
 mieru-manager delete-port 2012-2022            # delete a port range
 mieru-manager links                            # all links
 mieru-manager links ivan                       # one user's links
-mieru-manager qr ivan                          # QR code
+mieru-manager qr ivan                          # QR (short mierus://)
+mieru-manager qr ivan standard                 # QR of the mieru:// link
 mieru-manager config                           # mita config
 mieru-manager restart                          # restart mita
 mieru-manager backup                           # create a backup

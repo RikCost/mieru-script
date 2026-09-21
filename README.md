@@ -30,7 +30,8 @@ curl -fsSL https://cdn.jsdelivr.net/gh/RikCost/mieru-script@main/install.sh | ba
   настоящим клиентом `mieru` (скачивается в `/root/mieru/bin`, на работу
   сервера не влияет).
 - Клиентские конфиги (`*.json`) и ссылки (`*.txt`) для каждого пользователя.
-- QR-код ссылки (`qrencode`).
+- QR-код ссылки (по умолчанию из короткой `mierus://` — так надёжнее сканируется;
+  также сохраняется PNG в `clients/<имя>.png`).
 - Открытие/закрытие портов в `ufw` и `firewalld`.
 - Резервное копирование и восстановление конфигурации.
 - Обновление `mita` и самого `mieru-manager`.
@@ -81,7 +82,7 @@ bash /tmp/install.sh
 
 ```
 ────────────────────────────────────────────────────────────────
-             MIERU MANAGER 2.1.0
+             MIERU MANAGER 2.2.0
 ────────────────────────────────────────────────────────────────
   Сервер:  203.0.113.10
   Mita:    ● RUNNING
@@ -127,7 +128,8 @@ mieru-manager delete-port 2053                # удалить порт
 mieru-manager delete-port 2012-2022           # удалить диапазон
 mieru-manager links                            # все ссылки
 mieru-manager links ivan                       # ссылки одного пользователя
-mieru-manager qr ivan                          # QR-код
+mieru-manager qr ivan                          # QR (короткая mierus://)
+mieru-manager qr ivan standard                 # QR стандартной mieru://
 mieru-manager config                           # конфиг mita
 mieru-manager restart                          # перезапустить
 mieru-manager backup                           # резервная копия

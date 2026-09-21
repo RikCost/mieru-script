@@ -33,7 +33,7 @@
 set -uo pipefail
 
 APP_NAME="mieru-manager"
-APP_VERSION="2.1.0"
+APP_VERSION="2.2.0"
 REPO_RAW="${MIERU_REPO_RAW:-https://raw.githubusercontent.com/RikCost/mieru-script/main}"
 GITHUB_REPO="enfein/mieru"
 
@@ -969,6 +969,45 @@ op_show_links() { # op_show_links [user]
     hr
 }
 
+qr_render() { # <link> [png-путь]
+    local link="$1" png="${2:-}"
+    if ! command -v qrencode >/dev/null 2>&1; then
+        warn "qrencode не установлен — показываю только ссылку."
+        return 0
+    fi
+    if [[ -n "$png" ]]; then
+        if qrencode -o "$png" -s 8 -m 4 "$link" 2>/dev/null; then
+            chmod 600 "$png" 2>/dev/null || true
+            info "PNG с QR сохранён: $png"
+        fi
+    fi
+    qrencode -t ANSIUTF8 "$link" || true
+    # если QR шире окна терминала, он переносится и считывается с ошибкой
+    local width; width="$(tput cols 2>/dev/null || echo "${COLUMNS:-80}")"
+    if [[ "$width" =~ ^[0-9]+$ ]] && (( width < 78 )); then
+        warn "Окно терминала узкое (${width} колонок) — QR может «разъезжаться»."
+        [[ -n "$png" ]] && warn "Растяните окно или откройте PNG: $png"
+    fi
+}
+
+# Выбор ссылки для QR: по умолчанию короткая mierus:// (её же вы подтвердили,
+# что клиент принимает вручную).
+pick_qr_link() { # <simple> <standard> -> печатает выбранную
+    local simple="$1" std="$2" choice
+    if [[ -z "$std" ]]; then printf '%s' "$simple"; return 0; fi
+    if [[ -z "$simple" ]]; then printf '%s' "$std"; return 0; fi
+    if [[ "$HAS_TTY" -ne 1 ]]; then printf '%s' "$simple"; return 0; fi
+    echo >&2
+    echo "  Какую ссылку показать в QR?" >&2
+    echo "    1) mierus:// — короткая, её надёжнее сканировать (по умолчанию)" >&2
+    echo "    2) mieru://  — стандартная (base64, длиннее)" >&2
+    ask choice "  Выбор [1]: " "1"
+    case "$choice" in
+        2) printf '%s' "$std" ;;
+        *) printf '%s' "$simple" ;;
+    esac
+}
+
 op_show_qr_interactive() {
     local names=() i name choice link
     mapfile -t names < <(state_get -r '.users[].name' 2>/dev/null)
@@ -989,16 +1028,12 @@ op_show_qr_interactive() {
     out="$(generate_user_links "$name")" || { err "Не удалось получить ссылку."; return 1; }
     std="$(printf '%s\n' "$out" | sed -n 's/^STANDARD=//p')"
     simple="$(printf '%s\n' "$out" | sed -n 's/^SIMPLE=//p')"
-    link="${std:-$simple}"
+    link="$(pick_qr_link "$simple" "$std")"
 
     [[ -z "$link" ]] && { err "Ссылка пуста."; return 1; }
     echo
     printf '%s%s%s\n\n' "$C_BLD" "$name" "$C_RST"
-    if command -v qrencode >/dev/null 2>&1; then
-        qrencode -t ANSIUTF8 "$link" || true
-    else
-        warn "qrencode не установлен — показываю только ссылку."
-    fi
+    qr_render "$link" "$CLIENTS_DIR/$(sanitize_filename "$name").png"
     echo
     printf '%s\n' "$link"
 }
@@ -1422,7 +1457,7 @@ ${APP_NAME} v${APP_VERSION} — управление прокси-серверо
   add-port <порт|диапазон> <tcp|udp|both>   Добавить порт (443 или 2012-2022)
   delete-port <порт|диапазон>          Удалить порт (443 или 2012-2022)
   links [имя]                 Показать клиентские ссылки
-  qr <имя>                    Показать QR-код
+  qr <имя> [simple|standard]  Показать QR-код (по умолчанию короткая mierus://)
   config                      Показать конфигурацию mita
   restart                     Перезапустить mita
   backup                      Создать резервную копию
@@ -1582,7 +1617,7 @@ main() {
         add-port)     require_root; shift; cmd_add_port_cli "$@" ;;
         delete-port)  require_root; shift; cmd_delete_port_cli "$@" ;;
         links)        require_root; shift; op_show_links "${1:-}" ;;
-        qr)           require_root; shift; [[ -n "${1:-}" ]] || die "Укажите имя: qr <имя>"; op_show_qr_user "${1}" ;;
+        qr)           require_root; shift; [[ -n "${1:-}" ]] || die "Укажите имя: qr <имя> [simple|standard]"; op_show_qr_user "${1}" "${2:-simple}" ;;
         config)       require_root; op_show_config ;;
         restart)      require_root; op_restart ;;
         backup)       require_root; op_backup ;;
@@ -1599,16 +1634,20 @@ main() {
 
 # QR для конкретного пользователя без интерактивного выбора
 op_show_qr_user() {
-    local name="$1" out std simple link
+    local name="$1" mode="${2:-simple}" out std simple link
     state_get -e --arg n "$name" '.users[] | select(.name == $n)' 2>/dev/null | grep -q . \
         || die "Пользователь '$name' не найден."
     out="$(generate_user_links "$name")" || die "Не удалось получить ссылку."
     std="$(printf '%s\n' "$out" | sed -n 's/^STANDARD=//p')"
     simple="$(printf '%s\n' "$out" | sed -n 's/^SIMPLE=//p')"
-    link="${std:-$simple}"
+    case "$mode" in
+        standard|std|mieru) link="$std" ;;
+        *)                  link="$simple" ;;
+    esac
+    [[ -z "$link" ]] && link="${simple:-$std}"
     [[ -z "$link" ]] && die "Ссылка пуста."
     printf '%s%s%s\n\n' "$C_BLD" "$name" "$C_RST"
-    command -v qrencode >/dev/null 2>&1 && qrencode -t ANSIUTF8 "$link" || warn "qrencode не установлен."
+    qr_render "$link" "$CLIENTS_DIR/$(sanitize_filename "$name").png"
     echo
     printf '%s\n' "$link"
 }
