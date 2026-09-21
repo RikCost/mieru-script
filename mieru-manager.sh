@@ -69,12 +69,14 @@ err()  { printf '%s[-]%s %s\n' "$C_RED" "$C_RST" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 hr()   { printf '%s\n' "────────────────────────────────────────────────────────────────"; }
 
-# stdin может быть занят скриптом при `curl | bash` — забираем терминал.
+# stdin может быть занят скриптом при `curl | bash`.
+# НЕ меняем fd 0 через exec: при `curl | bash` bash читает сам скрипт из fd 0,
+# и переключение его на /dev/tty заставляет bash зависнуть, ожидая продолжения
+# скрипта с терминала. Вместо этого все интерактивные чтения идут из /dev/tty.
 HAS_TTY=0
 if [[ -t 0 ]]; then
     HAS_TTY=1
 elif [[ -e /dev/tty ]] && ( exec </dev/tty ) 2>/dev/null; then
-    exec </dev/tty
     HAS_TTY=1
 fi
 
@@ -298,16 +300,18 @@ install_deps() {
     local pkgs=(curl ca-certificates jq qrencode openssl)
     if command -v apt-get >/dev/null 2>&1; then
         export DEBIAN_FRONTEND=noninteractive
-        info "Устанавливаю зависимости (apt)..."
-        apt-get update -y >/dev/null 2>&1 || true
-        apt-get install -y --no-install-recommends "${pkgs[@]}" >/dev/null 2>&1 \
-            || apt-get install -y "${pkgs[@]}" >/dev/null 2>&1 || true
+        info "Обновляю списки пакетов (apt-get update). Может занять до минуты..."
+        apt-get update -qq
+        info "Устанавливаю зависимости: ${pkgs[*]}"
+        apt-get install -y -qq "${pkgs[@]}" || true
     elif command -v dnf >/dev/null 2>&1; then
-        info "Устанавливаю зависимости (dnf)..."
-        dnf install -y "${pkgs[@]}" >/dev/null 2>&1 || true
+        info "Устанавливаю зависимости (dnf): ${pkgs[*]}"
+        dnf install -y -q "${pkgs[@]}" || true
     elif command -v yum >/dev/null 2>&1; then
-        info "Устанавливаю зависимости (yum)..."
-        yum install -y "${pkgs[@]}" >/dev/null 2>&1 || true
+        info "Устанавливаю зависимости (yum): ${pkgs[*]}"
+        yum install -y -q "${pkgs[@]}" || true
+    else
+        warn "Не найден менеджер пакетов — проверяю зависимости вручную."
     fi
     ensure_jq
     command -v jq >/dev/null 2>&1 || die "Не удалось установить jq."
@@ -331,7 +335,7 @@ download_and_install_mita() { # download_and_install_mita [version]
         a="$(deb_arch)" || die "Неподдерживаемая архитектура для deb."
         f="mita_${ver}_${a}.deb"
         url="https://github.com/${GITHUB_REPO}/releases/download/v${ver}/${f}"
-        curl -fL --retry 3 --connect-timeout 15 -o "$tmp/$f" "$url" \
+        curl -fL --retry 3 --connect-timeout 15 --max-time 900 -o "$tmp/$f" "$url" \
             || { rm -rf "$tmp"; die "Не удалось скачать $f"; }
         dpkg -i "$tmp/$f" >/dev/null 2>&1 || true
         apt-get -f install -y >/dev/null 2>&1 || true
@@ -339,7 +343,7 @@ download_and_install_mita() { # download_and_install_mita [version]
         a="$(rpm_arch)" || die "Неподдерживаемая архитектура для rpm."
         f="mita-${ver}-1.${a}.rpm"
         url="https://github.com/${GITHUB_REPO}/releases/download/v${ver}/${f}"
-        curl -fL --retry 3 --connect-timeout 15 -o "$tmp/$f" "$url" \
+        curl -fL --retry 3 --connect-timeout 15 --max-time 900 -o "$tmp/$f" "$url" \
             || { rm -rf "$tmp"; die "Не удалось скачать $f"; }
         rpm -Uvh --force "$tmp/$f" >/dev/null 2>&1 || true
     else
@@ -423,7 +427,7 @@ ensure_mieru_bin() {
 
     tmp="$(mktemp -d)"
     url="https://github.com/${GITHUB_REPO}/releases/download/v${ver}/mieru_${ver}_linux_${a}.tar.gz"
-    if ! curl -fL --retry 3 --connect-timeout 15 -o "$tmp/mieru.tar.gz" "$url" >/dev/null 2>&1; then
+    if ! curl -fL --retry 3 --connect-timeout 15 --max-time 300 -o "$tmp/mieru.tar.gz" "$url" >/dev/null 2>&1; then
         rm -rf "$tmp"
         return 1
     fi
@@ -867,6 +871,7 @@ op_backup() {
     mapfile -t old < <(ls -1dt "$BACKUP_DIR"/*/ 2>/dev/null | tail -n +21)
     local d
     for d in "${old[@]:-}"; do [[ -n "$d" ]] && rm -rf "$d"; done
+    return 0
 }
 
 op_restore_interactive() {
@@ -982,9 +987,16 @@ op_restart() {
 }
 
 op_self_update() {
-    local tmp
+    local tmp url ok=0
     tmp="$(mktemp)"
-    if curl -fsSL "$REPO_RAW/mieru-manager.sh" -o "$tmp"; then
+    for url in "$REPO_RAW/mieru-manager.sh" \
+               "https://cdn.jsdelivr.net/gh/RikCost/mieru-script@main/mieru-manager.sh" \
+               "https://raw.githack.com/RikCost/mieru-script/main/mieru-manager.sh"; do
+        if curl -fsSL --retry 2 --connect-timeout 15 --max-time 120 -o "$tmp" "$url" && [[ -s "$tmp" ]]; then
+            ok=1; break
+        fi
+    done
+    if [[ "$ok" -eq 1 ]]; then
         install -m 0755 "$tmp" /usr/local/bin/mieru-manager 2>/dev/null \
             || cp "$tmp" /usr/local/bin/mieru-manager
         chmod 0755 /usr/local/bin/mieru-manager 2>/dev/null || true
@@ -1065,6 +1077,7 @@ first_run_wizard() {
 # ---------------------------------------------------------------------------
 cmd_install() {
     require_root install
+    info "${APP_NAME} v${APP_VERSION}: установка/настройка mita..."
     ensure_base_dirs
     state_init
     install_deps

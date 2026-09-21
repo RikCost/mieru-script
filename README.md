@@ -46,6 +46,20 @@ curl -fsSL https://raw.githubusercontent.com/RikCost/mieru-script/main/install.s
 curl -fsSL https://raw.githubusercontent.com/RikCost/mieru-script/main/install.sh | bash
 ```
 
+Если `raw.githubusercontent.com` с вашего VPS недоступен (частая проблема),
+используйте зеркало:
+
+```bash
+curl -fsSL https://cdn.jsdelivr.net/gh/RikCost/mieru-script@main/install.sh | bash
+```
+
+Или скачайте и запустите вручную, чтобы видеть все сообщения:
+
+```bash
+curl -fsSL -o /tmp/install.sh https://cdn.jsdelivr.net/gh/RikCost/mieru-script@main/install.sh
+bash /tmp/install.sh
+```
+
 Скрипт:
 
 1. поставит зависимости (`curl`, `jq`, `qrencode`, `openssl`);
@@ -193,6 +207,13 @@ mita get connections           # активные соединения
 
 Частые проблемы:
 
+- **Скрипт «висит» после запуска через `curl | bash`** — скорее всего, VPS не может
+  скачать файл с `raw.githubusercontent.com`. Проверьте:
+  `curl -v --connect-timeout 10 -o /dev/null https://raw.githubusercontent.com/RikCost/mieru-script/main/install.sh`.
+  Используйте зеркало jsDelivr (см. выше) или скачайте `install.sh` в файл и запустите.
+- **Ничего не происходит после `[+] Устанавливаю зависимости`** — идёт `apt-get update`
+  (может ждать блокировку dpkg). Проверьте в другом окне:
+  `ps aux | grep -E 'apt|dpkg'` и `fuser -v /var/lib/dpkg/lock-frontend`.
 - **Ссылка не импортируется** — проверьте, что клиент видит порт и протокол;
   время на клиенте и сервере должно совпадать (включите NTP).
 - **Порт не слушается** — `ss -lntup | grep <порт>`, проверьте облачный firewall.
