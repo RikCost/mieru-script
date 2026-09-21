@@ -1189,8 +1189,31 @@ print_menu_items() {
 EOF
 }
 
+cmd_self_check() {
+    printf '\n=== %s v%s self-check ===\n' "$APP_NAME" "$APP_VERSION"
+    printf 'HAS_TTY=%s  isatty: fd0=%s fd1=%s fd2=%s\n' \
+        "$HAS_TTY" \
+        "$([[ -t 0 ]] && echo yes || echo no)" \
+        "$([[ -t 1 ]] && echo yes || echo no)" \
+        "$([[ -t 2 ]] && echo yes || echo no)"
+    printf 'TERM=%s  LANG=%s  LC_ALL=%s\n' "${TERM:-}" "${LANG:-}" "${LC_ALL:-}"
+    printf 'fd0 -> %s\n' "$(readlink /proc/$$/fd/0 2>/dev/null)"
+    printf 'fd1 -> %s\n' "$(readlink /proc/$$/fd/1 2>/dev/null)"
+    printf 'fd2 -> %s\n' "$(readlink /proc/$$/fd/2 2>/dev/null)"
+    ls -l /dev/tty 2>&1 | sed 's/^/  /'
+    printf '%s\n' '--- тест вывода списка (stdout) ---'
+    print_menu_header
+    print_menu_items
+    printf '%s\n' '--- конец теста ---'
+    printf 'state: %s\n' "$STATE_FILE"
+}
+
 menu() {
     require_root
+    # На некоторых системах (обёртки, логирование, sudo-настройки) stdout менеджера
+    # может не совпадать с реальным терминалом. Тогда пишем меню напрямую в /dev/tty.
+    if [[ ! -t 1 && -w /dev/tty ]]; then exec 1>/dev/tty; fi
+    if [[ ! -t 2 && -w /dev/tty ]]; then exec 2>/dev/tty; fi
     while :; do
         # Очистка экрана только по явному желанию (по умолчанию список всегда виден).
         if [[ "${MIERU_CLEAR:-0}" == "1" ]] && command -v clear >/dev/null 2>&1; then
@@ -1258,6 +1281,7 @@ ${APP_NAME} v${APP_VERSION} — управление прокси-серверо
   restore <каталог>           Восстановить из копии
   update                      Обновить mita до последней версии
   self-update                 Обновить сам ${APP_NAME}
+  self-check                  Диагностика (терминал, tty, вывод)
   logs                        Показать журнал mita
   version                     Версия ${APP_NAME}
   help                        Эта справка
@@ -1390,6 +1414,7 @@ main() {
         restore)      require_root; shift; [[ -n "${1:-}" ]] || die "Укажите каталог: restore <каталог>"; op_restore_from "${1}" ;;
         update)       require_root; op_update ;;
         self-update)  require_root; op_self_update ;;
+        self-check)   cmd_self_check ;;
         logs)         require_root; op_logs ;;
         version)      printf '%s v%s\n' "$APP_NAME" "$APP_VERSION" ;;
         help|-h|--help) usage ;;
