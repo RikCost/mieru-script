@@ -1192,13 +1192,17 @@ EOF
 menu() {
     require_root
     while :; do
-        clear 2>/dev/null || true
+        # Очистка экрана только по явному желанию (по умолчанию список всегда виден).
+        if [[ "${MIERU_CLEAR:-0}" == "1" ]] && command -v clear >/dev/null 2>&1; then
+            clear 2>/dev/null || true
+        fi
         print_menu_header
         print_menu_items
         echo
         local choice u
-        ask choice "  Выберите действие [0-18]: " "0"
+        ask choice "  Действие [0-18, ? — список, 0 — выход]: " "0"
         case "$choice" in
+            "?"|h|H|help) continue ;;
             1)  op_add_user_interactive; pause ;;
             2)  op_delete_user_interactive; pause ;;
             3)  op_change_password_interactive; pause ;;

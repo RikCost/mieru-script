@@ -222,6 +222,9 @@ mita get connections           # активные соединения
 
 Частые проблемы:
 
+- **Не видно списка пунктов меню** — с PuTTY команда `clear` иногда стирает экран.
+  Очистка теперь отключена по умолчанию. Включить можно так: `MIERU_CLEAR=1 mieru-manager`.
+  В самом меню нажмите `?`, чтобы перерисовать список. Полный список команд: `mieru-manager help`.
 - **Скрипт «висит» после запуска через `curl | bash`** — скорее всего, VPS не может
   скачать файл с `raw.githubusercontent.com`. Проверьте:
   `curl -v --connect-timeout 10 -o /dev/null https://raw.githubusercontent.com/RikCost/mieru-script/main/install.sh`.
