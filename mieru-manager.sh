@@ -1,0 +1,1370 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  mieru-manager — установка и управление прокси-сервером mita (mieru) на VPS
+# =============================================================================
+#  Репозиторий : https://github.com/RikCost/mieru-script
+#  Лицензия    : MIT
+#  Проект mieru: https://github.com/enfein/mieru
+#
+#  Быстрый запуск (Debian / Ubuntu / RHEL / Fedora / CentOS):
+#
+#     curl -fsSL https://raw.githubusercontent.com/RikCost/mieru-script/main/install.sh | bash
+#
+#  После установки:
+#
+#     mieru-manager            # интерактивное меню
+#     mieru-manager help       # список всех команд
+#
+#  Что делает скрипт:
+#    * ставит mita (серверную часть mieru) официальным deb/rpm пакетом;
+#    * сам определяет внешний IPv4 сервера;
+#    * хранит ВСЁ состояние (пользователи, пароли, порты) в /root/mieru;
+#    * применяет конфиг через `mita apply config`, перезапускает службу;
+#    * открывает порты в ufw / firewalld;
+#    * генерирует официальные клиентские ссылки mieru:// и mierus://
+#      (через настоящий клиент mieru, скачанный в /root/mieru/bin);
+#    * показывает QR-код, делает и восстанавливает резервные копии.
+#
+#  ВАЖНО: сервер mita НЕ хранит пароли в открытом виде (только хеш).
+#  Поэтому источником истины для ссылок служит файл состояния:
+#      /root/mieru/state.json   (права 600, только для root)
+# =============================================================================
+
+set -uo pipefail
+
+APP_NAME="mieru-manager"
+APP_VERSION="2.0.0"
+REPO_RAW="${MIERU_REPO_RAW:-https://raw.githubusercontent.com/RikCost/mieru-script/main}"
+GITHUB_REPO="enfein/mieru"
+
+BASE_DIR="${MIERU_MANAGER_BASE:-/root/mieru}"
+STATE_FILE="$BASE_DIR/state.json"
+SERVER_JSON="$BASE_DIR/server_config.json"
+CLIENTS_DIR="$BASE_DIR/clients"
+BACKUP_DIR="$BASE_DIR/backups"
+BIN_DIR="$BASE_DIR/bin"
+MIERU_BIN="$BIN_DIR/mieru"
+
+# ---------------------------------------------------------------------------
+# Цвета
+# ---------------------------------------------------------------------------
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    C_RST=$'\033[0m'
+    C_BLD=$'\033[1m'
+    C_RED=$'\033[0;31m'
+    C_GRN=$'\033[0;32m'
+    C_YEL=$'\033[0;33m'
+    C_BLU=$'\033[0;36m'
+    C_MAG=$'\033[0;35m'
+else
+    C_RST=""; C_BLD=""; C_RED=""; C_GRN=""; C_YEL=""; C_BLU=""; C_MAG=""
+fi
+
+# ---------------------------------------------------------------------------
+# Ввод/вывод
+# ---------------------------------------------------------------------------
+info() { printf '%s[+]%s %s\n' "$C_GRN" "$C_RST" "$*"; }
+warn() { printf '%s[!]%s %s\n' "$C_YEL" "$C_RST" "$*" >&2; }
+err()  { printf '%s[-]%s %s\n' "$C_RED" "$C_RST" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+hr()   { printf '%s\n' "────────────────────────────────────────────────────────────────"; }
+
+# stdin может быть занят скриптом при `curl | bash` — забираем терминал.
+HAS_TTY=0
+if [[ -t 0 ]]; then
+    HAS_TTY=1
+elif [[ -e /dev/tty ]] && ( exec </dev/tty ) 2>/dev/null; then
+    exec </dev/tty
+    HAS_TTY=1
+fi
+
+ask() { # ask VAR "prompt" [default]
+    local __var="$1" __prompt="$2" __default="${3-}" __val=""
+    if [[ "$HAS_TTY" -ne 1 ]]; then printf -v "$__var" '%s' "$__default"; return 0; fi
+    read -r -p "$__prompt" __val </dev/tty || true
+    [[ -z "$__val" && -n "$__default" ]] && __val="$__default"
+    printf -v "$__var" '%s' "$__val"
+}
+
+ask_secret() { # ask_secret VAR "prompt"
+    local __var="$1" __prompt="$2" __val=""
+    if [[ "$HAS_TTY" -ne 1 ]]; then printf -v "$__var" '%s' ""; return 0; fi
+    read -rs -p "$__prompt" __val </dev/tty || true
+    printf '\n' >&2
+    printf -v "$__var" '%s' "$__val"
+}
+
+confirm() { # confirm "question" -> 0 = да
+    [[ "$HAS_TTY" -ne 1 ]] && return 0
+    local a
+    read -r -p "$1 [y/N]: " a </dev/tty || true
+    [[ "$a" =~ ^[YyДд]$ ]]
+}
+
+pause() {
+    [[ "$HAS_TTY" -ne 1 ]] && return 0
+    read -r -p "$(printf '%s' "${C_BLU}Нажмите Enter для продолжения...${C_RST}")" _ </dev/tty || true
+}
+
+# ---------------------------------------------------------------------------
+# Разное
+# ---------------------------------------------------------------------------
+sanitize_filename() { printf '%s' "${1//[^A-Za-z0-9_.@-]/_}"; }
+
+gen_password() {
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -base64 32 2>/dev/null | tr -dc 'A-Za-z0-9' | cut -c1-20
+    else
+        LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 20
+    fi
+    printf '\n'
+}
+
+os_id() { ( . /etc/os-release 2>/dev/null; printf '%s %s' "${ID:-}" "${ID_LIKE:-}" ); }
+is_debian() { local s; s="$(os_id)"; [[ "$s" == *debian* || "$s" == *ubuntu* ]]; }
+is_rhel()   { local s; s="$(os_id)"; [[ "$s" == *rhel* || "$s" == *fedora* || "$s" == *centos* ]]; }
+
+deb_arch() { case "$(uname -m)" in x86_64|amd64) echo amd64;; aarch64|arm64) echo arm64;; *) return 1;; esac; }
+rpm_arch() { case "$(uname -m)" in x86_64|amd64) echo x86_64;; aarch64|arm64) echo aarch64;; *) return 1;; esac; }
+tar_arch() { case "$(uname -m)" in x86_64|amd64) echo amd64;; aarch64|arm64) echo arm64;; armv7l|armv7) echo armv7;; *) return 1;; esac; }
+
+require_root() {
+    [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Запустите от root: sudo $APP_NAME $*"
+}
+
+ensure_base_dirs() {
+    mkdir -p "$BASE_DIR" "$CLIENTS_DIR" "$BACKUP_DIR" "$BIN_DIR"
+    chmod 700 "$BASE_DIR" "$CLIENTS_DIR" "$BACKUP_DIR" "$BIN_DIR" 2>/dev/null || true
+    touch "$BASE_DIR/manager.log" && chmod 600 "$BASE_DIR/manager.log" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Состояние (единственный источник истины)
+# ---------------------------------------------------------------------------
+state_exists() { [[ -f "$STATE_FILE" ]]; }
+
+state_get() { # state_get [jq-опции] 'фильтр'
+    state_exists || return 1
+    jq "$@" "$STATE_FILE" | tr -d '\r'
+}
+
+state_update() { # state_update [jq-опции] 'фильтр'
+    local tmp
+    tmp="$(mktemp "$BASE_DIR/.state.XXXXXX")" || return 1
+    if jq "$@" "$STATE_FILE" >"$tmp" 2>/dev/null; then
+        mv "$tmp" "$STATE_FILE"
+        chmod 600 "$STATE_FILE"
+    else
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+get_public_ip() {
+    local ip svc
+    for svc in "https://api.ipify.org" "https://ifconfig.me/ip" "https://icanhazip.com" "https://ipinfo.io/ip"; do
+        ip="$(curl -4 -fsS --max-time 8 "$svc" 2>/dev/null | tr -d '[:space:]')"
+        if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            printf '%s\n' "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
+state_init() {
+    ensure_base_dirs
+    [[ -f "$STATE_FILE" ]] && return 0
+
+    local ip
+    ip="$(get_public_ip || true)"
+    if [[ -z "$ip" ]]; then
+        if [[ "$HAS_TTY" -eq 1 ]]; then
+            ask ip "Введите внешний IPv4 сервера вручную (можно оставить пустым): " ""
+        fi
+        [[ -z "$ip" ]] && ip="YOUR_SERVER_IP"
+    fi
+
+    jq -n --arg ip "$ip" --arg ts "$(date -Is)" '{
+        version: 2,
+        serverAddress: $ip,
+        mtu: 1400,
+        loggingLevel: "INFO",
+        multiplexing: "MULTIPLEXING_HIGH",
+        handshakeMode: "HANDSHAKE_STANDARD",
+        dns: { dualStack: "PREFER_IPv4" },
+        ports: [],
+        users: [],
+        mitaVersion: "",
+        createdAt: $ts,
+        updatedAt: $ts
+    }' >"$STATE_FILE"
+    chmod 600 "$STATE_FILE"
+    info "Создан файл состояния: $STATE_FILE"
+}
+
+state_touch() { state_update --arg ts "$(date -Is)" '.updatedAt = $ts' || true; }
+
+# ---------------------------------------------------------------------------
+# JSON конфигурации
+# ---------------------------------------------------------------------------
+generate_server_config() {
+    state_exists || { err "Нет файла состояния."; return 1; }
+    local tmp
+    tmp="$(mktemp "$BASE_DIR/.server.XXXXXX")" || return 1
+    if jq '{
+            portBindings: [ .ports[]  | { port: .port, protocol: .protocol } ],
+            users:        [ .users[]  | { name: .name, password: .password } ],
+            loggingLevel: .loggingLevel,
+            mtu:          .mtu,
+            dns:          .dns
+        }' "$STATE_FILE" >"$tmp"; then
+        mv "$tmp" "$SERVER_JSON"
+        chmod 600 "$SERVER_JSON"
+    else
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+build_client_config() { # build_client_config <user> -> JSON в stdout
+    local u="$1"
+    jq --arg name "$u" '
+        (.users[] | select(.name == $name)) as $usr
+        | {
+            profiles: [ {
+                profileName: $name,
+                user: { name: $usr.name, password: $usr.password },
+                servers: [ {
+                    ipAddress: .serverAddress,
+                    domainName: "",
+                    portBindings: [ .ports[] | { port: .port, protocol: .protocol } ]
+                } ],
+                mtu: .mtu,
+                multiplexing: { level: .multiplexing },
+                handshakeMode: .handshakeMode
+            } ],
+            activeProfile: $name,
+            rpcPort: 8964,
+            socks5Port: 1080,
+            httpProxyPort: 8080,
+            loggingLevel: "INFO",
+            socks5ListenLAN: false,
+            httpProxyListenLAN: false
+        }' "$STATE_FILE"
+}
+
+build_simple_link() { # build_simple_link <user> -> mierus://...
+    local u="$1" pw ip host enc_u enc_p q="" p proto
+    pw="$(state_get -r --arg n "$u" '.users[] | select(.name == $n) | .password')"
+    ip="$(state_get -r '.serverAddress')"
+    [[ "$ip" == *:* ]] && host="[$ip]" || host="$ip"
+
+    enc_u="$(jq -rn --arg s "$u" '$s | @uri')"
+    enc_p="$(jq -rn --arg s "$pw" '$s | @uri')"
+
+    q="profile=$(jq -rn --arg s "$u" '$s | @uri')"
+    q+="&mtu=$(state_get -r '.mtu')"
+    q+="&multiplexing=$(state_get -r '.multiplexing')"
+    q+="&handshake-mode=$(state_get -r '.handshakeMode')"
+    while IFS=$'\t' read -r p proto; do
+        p="${p%$'\r'}"; proto="${proto%$'\r'}"
+        [[ -z "$p" ]] && continue
+        q+="&port=${p}&protocol=${proto}"
+    done < <(state_get -r '.ports[] | "\(.port)\t\(.protocol)"')
+
+    printf 'mierus://%s:%s@%s?%s\n' "$enc_u" "$enc_p" "$host" "$q"
+}
+
+# ---------------------------------------------------------------------------
+# Установка зависимостей и mita
+# ---------------------------------------------------------------------------
+ensure_jq() {
+    command -v jq >/dev/null 2>&1 && return 0
+    local a
+    case "$(uname -m)" in
+        x86_64|amd64) a="amd64" ;;
+        aarch64|arm64) a="arm64" ;;
+        armv7l|armv7) a="armhf" ;;
+        *) return 1 ;;
+    esac
+    warn "jq не найден — скачиваю статический бинарник..."
+    curl -fsSL -o /usr/local/bin/jq \
+        "https://github.com/jqlang/jq/releases/latest/download/jq-linux-${a}" \
+        && chmod 0755 /usr/local/bin/jq
+}
+
+install_deps() {
+    local pkgs=(curl ca-certificates jq qrencode openssl)
+    if command -v apt-get >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
+        info "Устанавливаю зависимости (apt)..."
+        apt-get update -y >/dev/null 2>&1 || true
+        apt-get install -y --no-install-recommends "${pkgs[@]}" >/dev/null 2>&1 \
+            || apt-get install -y "${pkgs[@]}" >/dev/null 2>&1 || true
+    elif command -v dnf >/dev/null 2>&1; then
+        info "Устанавливаю зависимости (dnf)..."
+        dnf install -y "${pkgs[@]}" >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then
+        info "Устанавливаю зависимости (yum)..."
+        yum install -y "${pkgs[@]}" >/dev/null 2>&1 || true
+    fi
+    ensure_jq
+    command -v jq >/dev/null 2>&1 || die "Не удалось установить jq."
+    command -v curl >/dev/null 2>&1 || die "Не удалось установить curl."
+}
+
+latest_mita_version() {
+    curl -fsSL --max-time 15 "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null \
+        | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//'
+}
+
+download_and_install_mita() { # download_and_install_mita [version]
+    local ver="${1:-}" a tmp f url
+    [[ -z "$ver" ]] && ver="$(latest_mita_version)"
+    [[ -n "$ver" && "$ver" != "null" ]] || die "Не удалось определить версию mita."
+
+    tmp="$(mktemp -d)"
+    info "Устанавливаю mita v${ver}..."
+
+    if is_debian; then
+        a="$(deb_arch)" || die "Неподдерживаемая архитектура для deb."
+        f="mita_${ver}_${a}.deb"
+        url="https://github.com/${GITHUB_REPO}/releases/download/v${ver}/${f}"
+        curl -fL --retry 3 --connect-timeout 15 -o "$tmp/$f" "$url" \
+            || { rm -rf "$tmp"; die "Не удалось скачать $f"; }
+        dpkg -i "$tmp/$f" >/dev/null 2>&1 || true
+        apt-get -f install -y >/dev/null 2>&1 || true
+    elif is_rhel; then
+        a="$(rpm_arch)" || die "Неподдерживаемая архитектура для rpm."
+        f="mita-${ver}-1.${a}.rpm"
+        url="https://github.com/${GITHUB_REPO}/releases/download/v${ver}/${f}"
+        curl -fL --retry 3 --connect-timeout 15 -o "$tmp/$f" "$url" \
+            || { rm -rf "$tmp"; die "Не удалось скачать $f"; }
+        rpm -Uvh --force "$tmp/$f" >/dev/null 2>&1 || true
+    else
+        rm -rf "$tmp"
+        die "Поддерживаются Debian/Ubuntu и RHEL/Fedora/CentOS."
+    fi
+    rm -rf "$tmp"
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable mita >/dev/null 2>&1 || true
+    systemctl start mita >/dev/null 2>&1 || true
+    sleep 1
+
+    command -v mita >/dev/null 2>&1 || die "Команда mita не найдена после установки."
+    state_exists && state_update --arg v "$ver" '.mitaVersion = $v' >/dev/null 2>&1 || true
+    info "mita v${ver} установлен."
+}
+
+mita_ensure_daemon() {
+    systemctl start mita >/dev/null 2>&1 || true
+    local i
+    for i in 1 2 3 4 5; do
+        mita status >/dev/null 2>&1 && return 0
+        sleep 1
+    done
+    return 0
+}
+
+mita_proxy_running() { mita status 2>&1 | grep -q 'RUNNING'; }
+
+mita_current_users() {
+    mita get users 2>&1 | awk 'NR>1 && NF>0 {print $1}' | grep -E '^[A-Za-z0-9_.@-]+$' | grep -v '^User$' | sort -u
+}
+
+apply_server_config() {
+    generate_server_config || return 1
+    if [[ "$(state_get -r '.users | length')" -eq 0 ]]; then
+        warn "В конфигурации нет пользователей — пропускаю применение."
+        return 1
+    fi
+    mita_ensure_daemon >/dev/null 2>&1 || true
+    mita apply config "$SERVER_JSON" >/dev/null
+}
+
+mita_soft_apply() { # изменились только пользователи/логирование
+    apply_server_config || return 1
+    if mita_proxy_running; then
+        mita reload >/dev/null 2>&1 || mita stop >/dev/null 2>&1 && mita start >/dev/null 2>&1
+    else
+        mita start >/dev/null 2>&1
+    fi
+}
+
+mita_hard_apply() { # изменились порты / mtu — нужен перезапуск
+    mita_ensure_daemon >/dev/null 2>&1 || true
+    mita stop >/dev/null 2>&1 || true
+    apply_server_config || return 1
+    mita start >/dev/null 2>&1
+}
+
+# Мягкий вариант: если пользователей ещё нет, просто сохраняем состояние.
+try_hard_apply() {
+    if [[ "$(state_get -r '.users | length' 2>/dev/null || echo 0)" -eq 0 ]]; then
+        warn "Пользователей пока нет — конфигурация сохранена и будет применена позже."
+        return 0
+    fi
+    mita_hard_apply
+}
+
+# ---------------------------------------------------------------------------
+# Клиент mieru (для официальных ссылок) и генерация ссылок
+# ---------------------------------------------------------------------------
+ensure_mieru_bin() {
+    [[ -x "$MIERU_BIN" ]] && return 0
+    ensure_base_dirs
+    local a ver url tmp found
+    a="$(tar_arch)" || { warn "Архитектура $(uname -m) не поддерживается для клиента mieru."; return 1; }
+    ver="$(state_get -r '.mitaVersion // empty' 2>/dev/null || true)"
+    [[ -z "$ver" ]] && ver="$(latest_mita_version)"
+    [[ -n "$ver" && "$ver" != "null" ]] || return 1
+
+    tmp="$(mktemp -d)"
+    url="https://github.com/${GITHUB_REPO}/releases/download/v${ver}/mieru_${ver}_linux_${a}.tar.gz"
+    if ! curl -fL --retry 3 --connect-timeout 15 -o "$tmp/mieru.tar.gz" "$url" >/dev/null 2>&1; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    if ! tar -xzf "$tmp/mieru.tar.gz" -C "$tmp" >/dev/null 2>&1; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    found="$(find "$tmp" -type f -name mieru -print -quit 2>/dev/null)"
+    if [[ -z "$found" ]]; then rm -rf "$tmp"; return 1; fi
+    install -m 0755 "$found" "$MIERU_BIN" 2>/dev/null || cp "$found" "$MIERU_BIN"
+    chmod 0755 "$MIERU_BIN" 2>/dev/null || true
+    rm -rf "$tmp"
+    [[ -x "$MIERU_BIN" ]]
+}
+
+generate_user_links() { # -> "STANDARD=...\nSIMPLE=..."
+    local u="$1" cfg tmp std="" simple=""
+    ensure_base_dirs
+    cfg="$(build_client_config "$u")"
+    [[ -n "$cfg" ]] || return 1
+
+    if ensure_mieru_bin; then
+        tmp="$(mktemp -d)"; chmod 700 "$tmp"
+        printf '%s' "$cfg" >"$tmp/client.json"
+        if ( export HOME="$tmp" XDG_CONFIG_HOME="$tmp/.config" USERPROFILE="$tmp"; \
+             "$MIERU_BIN" apply config "$tmp/client.json" ) >/dev/null 2>&1; then
+            std="$( ( export HOME="$tmp" XDG_CONFIG_HOME="$tmp/.config" USERPROFILE="$tmp"; \
+                      "$MIERU_BIN" export config ) 2>&1 \
+                    | grep -oE 'mieru://[^[:space:]]+' | head -n1 )"
+            simple="$( ( export HOME="$tmp" XDG_CONFIG_HOME="$tmp/.config" USERPROFILE="$tmp"; \
+                         "$MIERU_BIN" export config simple ) 2>&1 \
+                       | grep -oE 'mierus://[^[:space:]]+' | head -n1 )"
+        fi
+        rm -rf "$tmp"
+    fi
+
+    [[ -z "$simple" ]] && simple="$(build_simple_link "$u")"
+    printf 'STANDARD=%s\nSIMPLE=%s\n' "$std" "$simple"
+}
+
+write_client_files() { # <user> <standard> <simple>
+    local u="$1" std="$2" simple="$3" safe f
+    ensure_base_dirs
+    safe="$(sanitize_filename "$u")"
+    f="$CLIENTS_DIR/$safe"
+    {
+        echo "# mieru client: $u"
+        echo "# server : $(state_get -r '.serverAddress')"
+        echo "# updated: $(date -Is)"
+        echo
+        echo "# Стандартная ссылка (для импорта на новом устройстве):"
+        [[ -n "$std" ]] && echo "$std"
+        echo
+        echo "# Простая ссылка (mierus://):"
+        [[ -n "$simple" ]] && echo "$simple"
+    } >"$f.txt"
+    chmod 600 "$f.txt"
+    build_client_config "$u" >"$f.json" 2>/dev/null && chmod 600 "$f.json" || true
+}
+
+save_user_links() { # <user> -> печатает ссылки и сохраняет файлы
+    local u="$1" out std simple
+    out="$(generate_user_links "$u")" || { warn "Не удалось сгенерировать ссылки для $u"; return 1; }
+    std="$(printf '%s\n' "$out" | sed -n 's/^STANDARD=//p')"
+    simple="$(printf '%s\n' "$out" | sed -n 's/^SIMPLE=//p')"
+    write_client_files "$u" "$std" "$simple"
+    printf '%s\n' "$std" "$simple"
+}
+
+regenerate_all_links() {
+    ensure_base_dirs
+    local u
+    while IFS= read -r u; do
+        [[ -z "$u" ]] && continue
+        save_user_links "$u" >/dev/null || warn "Ссылки для $u не обновлены."
+    done < <(state_get -r '.users[].name')
+    info "Клиентские ссылки обновлены в $CLIENTS_DIR"
+}
+
+# ---------------------------------------------------------------------------
+# Firewall
+# ---------------------------------------------------------------------------
+firewall_allow_port() {
+    local port="$1" proto="$2" lp
+    lp="$(printf '%s' "$proto" | tr 'A-Z' 'a-z')"
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow "${port}/${lp}" >/dev/null 2>&1 || true
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --permanent --add-port="${port}/${lp}" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+}
+
+firewall_deny_port() {
+    local port="$1" proto="$2" lp
+    lp="$(printf '%s' "$proto" | tr 'A-Z' 'a-z')"
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw delete allow "${port}/${lp}" >/dev/null 2>&1 || true
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --permanent --remove-port="${port}/${lp}" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Операции: пользователи
+# ---------------------------------------------------------------------------
+valid_user_name() { [[ "$1" =~ ^[A-Za-z0-9_.@-]{1,64}$ ]]; }
+
+op_add_user_interactive() {
+    local name pw pw2
+    echo
+    hr
+    printf '%s              ДОБАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯ%s\n' "$C_BLD" "$C_RST"
+    hr
+
+    while :; do
+        ask name "Имя пользователя: " ""
+        if [[ -z "$name" ]]; then warn "Имя не может быть пустым."; continue; fi
+        if ! valid_user_name "$name"; then
+            warn "Допустимы латиница, цифры и символы _ . @ - (до 64 символов)."
+            continue
+        fi
+        if state_get -e --arg n "$name" '.users[] | select(.name == $n)' 2>/dev/null | grep -q .; then
+            warn "Пользователь '$name' уже существует."
+            continue
+        fi
+        break
+    done
+
+    ask_secret pw "Пароль (Enter = сгенерировать автоматически): "
+    if [[ -z "$pw" ]]; then
+        pw="$(gen_password)"
+        info "Сгенерирован пароль: ${C_BLD}${pw}${C_RST}"
+    else
+        ask_secret pw2 "Повторите пароль: "
+        [[ "$pw" == "$pw2" ]] || { err "Пароли не совпадают."; return 1; }
+    fi
+    if (( ${#pw} > 64 )); then err "Пароль длиннее 64 байт — mita его не примет."; return 1; fi
+
+    state_update --arg n "$name" --arg p "$pw" \
+        '.users += [{name:$n, password:$p}]' || { err "Не удалось сохранить состояние."; return 1; }
+    state_touch
+
+    if ! mita_soft_apply; then
+        warn "Конфигурация не применилась. Проверьте: mita describe config"
+        return 1
+    fi
+    info "Пользователь '${name}' добавлен, mita перезагружен."
+
+    echo
+    local out
+    out="$(save_user_links "$name")"
+    printf '%sСсылки:%s\n%s\n' "$C_BLD" "$C_RST" "$out"
+    echo
+    info "Сохранено: $CLIENTS_DIR/$(sanitize_filename "$name").txt"
+}
+
+op_delete_user_interactive() {
+    local names=() i name
+    mapfile -t names < <(state_get -r '.users[].name' 2>/dev/null)
+    if (( ${#names[@]} == 0 )); then warn "Пользователей нет."; return 0; fi
+
+    echo
+    hr
+    printf '%s               УДАЛЕНИЕ ПОЛЬЗОВАТЕЛЯ%s\n' "$C_BLD" "$C_RST"
+    hr
+    for i in "${!names[@]}"; do printf '  %2d) %s\n' "$((i+1))" "${names[$i]}"; done
+    echo
+
+    local choice
+    ask choice "Номер пользователя (0 — отмена): " "0"
+    [[ "$choice" =~ ^[0-9]+$ ]] || { warn "Неверный ввод."; return 1; }
+    (( choice >= 1 && choice <= ${#names[@]} )) || { info "Отменено."; return 0; }
+    name="${names[$((choice-1))]}"
+
+    confirm "Удалить пользователя '$name'?" || { info "Отменено."; return 0; }
+
+    mita_ensure_daemon >/dev/null 2>&1 || true
+    mita delete user "$name" >/dev/null 2>&1 || warn "mita delete user вернул ошибку."
+    state_update --arg n "$name" '.users = [ .users[] | select(.name != $n) ]' \
+        || { err "Не удалось обновить состояние."; return 1; }
+    state_touch
+    if mita_proxy_running; then mita reload >/dev/null 2>&1 || true; fi
+
+    rm -f "$CLIENTS_DIR/$(sanitize_filename "$name").txt" "$CLIENTS_DIR/$(sanitize_filename "$name").json"
+    info "Пользователь '${name}' удалён."
+}
+
+op_change_password_interactive() {
+    local names=() i name pw pw2 choice
+    mapfile -t names < <(state_get -r '.users[].name' 2>/dev/null)
+    if (( ${#names[@]} == 0 )); then warn "Пользователей нет."; return 0; fi
+
+    echo
+    hr
+    printf '%s               СМЕНА ПАРОЛЯ%s\n' "$C_BLD" "$C_RST"
+    hr
+    for i in "${!names[@]}"; do printf '  %2d) %s\n' "$((i+1))" "${names[$i]}"; done
+    echo
+    ask choice "Номер пользователя (0 — отмена): " "0"
+    [[ "$choice" =~ ^[0-9]+$ ]] || { warn "Неверный ввод."; return 1; }
+    (( choice >= 1 && choice <= ${#names[@]} )) || { info "Отменено."; return 0; }
+    name="${names[$((choice-1))]}"
+
+    ask_secret pw "Новый пароль (Enter = сгенерировать): "
+    if [[ -z "$pw" ]]; then
+        pw="$(gen_password)"
+        info "Сгенерирован пароль: ${C_BLD}${pw}${C_RST}"
+    else
+        ask_secret pw2 "Повторите пароль: "
+        [[ "$pw" == "$pw2" ]] || { err "Пароли не совпадают."; return 1; }
+    fi
+    (( ${#pw} <= 64 )) || { err "Пароль длиннее 64 байт."; return 1; }
+
+    state_update --arg n "$name" --arg p "$pw" \
+        '(.users[] | select(.name == $n) | .password) = $p' \
+        || { err "Не удалось обновить состояние."; return 1; }
+    state_touch
+
+    mita_soft_apply || { warn "Конфигурация не применилась."; return 1; }
+    info "Пароль пользователя '${name}' изменён."
+    save_user_links "$name" >/dev/null
+}
+
+op_list_users() {
+    local names=()
+    mapfile -t names < <(state_get -r '.users[].name' 2>/dev/null)
+    echo
+    hr
+    printf '%s                    ПОЛЬЗОВАТЕЛИ%s\n' "$C_BLD" "$C_RST"
+    hr
+    if (( ${#names[@]} == 0 )); then
+        warn "Пользователей нет."
+    else
+        local n p
+        printf '  %-24s %-26s %s\n' "ИМЯ" "ПАРОЛЬ" "ФАЙЛ"
+        hr
+        for n in "${names[@]}"; do
+            p="$(state_get -r --arg n "$n" '.users[] | select(.name == $n) | .password')"
+            printf '  %-24s %-26s %s\n' "$n" "$p" "$(sanitize_filename "$n").txt"
+        done
+    fi
+    hr
+    echo
+    info "Трафик (mita get users):"
+    mita get users 2>&1 | sed 's/^/  /' || true
+}
+
+# ---------------------------------------------------------------------------
+# Операции: порты
+# ---------------------------------------------------------------------------
+valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
+
+op_add_port_interactive() {
+    local port proto choice
+    echo
+    hr
+    printf '%s                 ДОБАВЛЕНИЕ ПОРТА%s\n' "$C_BLD" "$C_RST"
+    hr
+    ask port "Порт (1-65535): " ""
+    valid_port "$port" || { err "Некорректный порт."; return 1; }
+    ask choice "Протокол: 1) TCP  2) UDP  3) TCP+UDP  [1]: " "1"
+
+    local list=()
+    case "$choice" in
+        1|"") list=(TCP) ;;
+        2)     list=(UDP) ;;
+        3)     list=(TCP UDP) ;;
+        *)     err "Неверный выбор."; return 1 ;;
+    esac
+
+    local added=0 p
+    for p in "${list[@]}"; do
+        if state_get -e --argjson p "$port" --arg t "$p" \
+            '.ports[] | select(.port == $p and .protocol == $t)' 2>/dev/null | grep -q .; then
+            warn "Порт ${port}/${p} уже добавлен."
+            continue
+        fi
+        state_update --argjson p "$port" --arg t "$p" \
+            '.ports += [{port:$p, protocol:$t}]' || return 1
+        firewall_allow_port "$port" "$p"
+        info "Добавлен ${port}/${p}"
+        added=1
+    done
+    [[ "$added" -eq 0 ]] && return 0
+
+    state_touch
+    if ! try_hard_apply; then warn "Не удалось перезапустить mita."; return 1; fi
+    info "mita перезапущен с новыми портами."
+    regenerate_all_links
+}
+
+op_delete_port_interactive() {
+    local items=() i p t choice
+    mapfile -t items < <(state_get -r '.ports[] | "\(.port)\t\(.protocol)"' 2>/dev/null)
+    if (( ${#items[@]} == 0 )); then warn "Портов нет."; return 0; fi
+
+    echo
+    hr
+    printf '%s                   УДАЛЕНИЕ ПОРТА%s\n' "$C_BLD" "$C_RST"
+    hr
+    for i in "${!items[@]}"; do
+        IFS=$'\t' read -r p t <<<"${items[$i]}"
+        printf '  %2d) %s %s\n' "$((i+1))" "$p" "$t"
+    done
+    echo
+    ask choice "Номер порта (0 — отмена): " "0"
+    [[ "$choice" =~ ^[0-9]+$ ]] || { warn "Неверный ввод."; return 1; }
+    (( choice >= 1 && choice <= ${#items[@]} )) || { info "Отменено."; return 0; }
+    IFS=$'\t' read -r p t <<<"${items[$((choice-1))]}"
+
+    confirm "Удалить порт ${p}/${t}?" || { info "Отменено."; return 0; }
+
+    state_update --argjson p "$p" --arg t "$t" \
+        '.ports = [ .ports[] | select(.port != $p or .protocol != $t) ]' || return 1
+    state_touch
+    firewall_deny_port "$p" "$t"
+    if ! try_hard_apply; then warn "Не удалось перезапустить mita."; return 1; fi
+    info "Порт ${p}/${t} удалён, mita перезапущен."
+    regenerate_all_links
+}
+
+op_list_ports() {
+    local items=()
+    mapfile -t items < <(state_get -r '.ports[] | "\(.port)\t\(.protocol)"' 2>/dev/null)
+    echo
+    hr
+    printf '%s                      ПОРТЫ%s\n' "$C_BLD" "$C_RST"
+    hr
+    if (( ${#items[@]} == 0 )); then
+        warn "Портов нет."
+    else
+        local i p t state
+        printf '  %-6s %-10s %-8s %s\n' "ID" "ПОРТ" "ПРОТО" "СЛУШАЕТСЯ"
+        hr
+        for i in "${!items[@]}"; do
+            IFS=$'\t' read -r p t <<<"${items[$i]}"
+            state="?"
+            if command -v ss >/dev/null 2>&1; then
+                if [[ "$t" == "TCP" ]]; then
+                    ss -lntH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}$" && state="да" || state="нет"
+                else
+                    ss -lnuH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}$" && state="да" || state="нет"
+                fi
+            fi
+            printf '  %-6s %-10s %-8s %s\n' "$((i+1))" "$p" "$t" "$state"
+        done
+    fi
+    hr
+}
+
+# ---------------------------------------------------------------------------
+# Операции: ссылки / QR
+# ---------------------------------------------------------------------------
+op_show_links() { # op_show_links [user]
+    local only="${1:-}" u
+    [[ -n "$only" ]] && regenerate_all_links >/dev/null 2>&1 || true
+    echo
+    hr
+    printf '%s                   КЛИЕНТСКИЕ ССЫЛКИ%s\n' "$C_BLD" "$C_RST"
+    hr
+    local found=0
+    while IFS= read -r u; do
+        [[ -z "$u" ]] && continue
+        [[ -n "$only" && "$u" != "$only" ]] && continue
+        found=1
+        printf '\n%s%s%s\n' "$C_BLD" "$u" "$C_RST"
+        hr
+        local out std simple
+        out="$(generate_user_links "$u")" || { warn "Не удалось сгенерировать для $u"; continue; }
+        std="$(printf '%s\n' "$out" | sed -n 's/^STANDARD=//p')"
+        simple="$(printf '%s\n' "$out" | sed -n 's/^SIMPLE=//p')"
+        write_client_files "$u" "$std" "$simple"
+        [[ -n "$std" ]]    && printf 'mieru://  %s\n' "$std"
+        [[ -n "$simple" ]] && printf 'mierus:// %s\n' "$simple"
+        printf 'файл: %s\n' "$CLIENTS_DIR/$(sanitize_filename "$u").txt"
+    done < <(state_get -r '.users[].name' 2>/dev/null)
+    (( found == 0 )) && warn "Пользователи не найдены."
+    hr
+}
+
+op_show_qr_interactive() {
+    local names=() i name choice link
+    mapfile -t names < <(state_get -r '.users[].name' 2>/dev/null)
+    if (( ${#names[@]} == 0 )); then warn "Пользователей нет."; return 0; fi
+
+    echo
+    hr
+    printf '%s                     QR-КОД%s\n' "$C_BLD" "$C_RST"
+    hr
+    for i in "${!names[@]}"; do printf '  %2d) %s\n' "$((i+1))" "${names[$i]}"; done
+    echo
+    ask choice "Номер пользователя (0 — отмена): " "0"
+    [[ "$choice" =~ ^[0-9]+$ ]] || { warn "Неверный ввод."; return 1; }
+    (( choice >= 1 && choice <= ${#names[@]} )) || { info "Отменено."; return 0; }
+    name="${names[$((choice-1))]}"
+
+    local out simple std
+    out="$(generate_user_links "$name")" || { err "Не удалось получить ссылку."; return 1; }
+    std="$(printf '%s\n' "$out" | sed -n 's/^STANDARD=//p')"
+    simple="$(printf '%s\n' "$out" | sed -n 's/^SIMPLE=//p')"
+    link="${std:-$simple}"
+
+    [[ -z "$link" ]] && { err "Ссылка пуста."; return 1; }
+    echo
+    printf '%s%s%s\n\n' "$C_BLD" "$name" "$C_RST"
+    if command -v qrencode >/dev/null 2>&1; then
+        qrencode -t ANSIUTF8 "$link" || true
+    else
+        warn "qrencode не установлен — показываю только ссылку."
+    fi
+    echo
+    printf '%s\n' "$link"
+}
+
+# ---------------------------------------------------------------------------
+# Backup / restore
+# ---------------------------------------------------------------------------
+op_backup() {
+    ensure_base_dirs
+    local stamp dir
+    stamp="$(date +%Y%m%d_%H%M%S)"
+    dir="$BACKUP_DIR/$stamp"
+    mkdir -p "$dir"
+    chmod 700 "$dir"
+
+    state_exists && cp -p "$STATE_FILE" "$dir/state.json" 2>/dev/null || true
+    [[ -f "$SERVER_JSON" ]] && cp -p "$SERVER_JSON" "$dir/server_config.json" 2>/dev/null || true
+    if [[ -d "$CLIENTS_DIR" ]]; then
+        cp -rp "$CLIENTS_DIR" "$dir/clients" 2>/dev/null || true
+    fi
+    mita describe config >"$dir/mita_describe_config.json" 2>/dev/null || true
+    chmod 600 "$dir"/* 2>/dev/null || true
+
+    info "Backup создан: $dir"
+
+    # оставляем последние 20 копий
+    mapfile -t old < <(ls -1dt "$BACKUP_DIR"/*/ 2>/dev/null | tail -n +21)
+    local d
+    for d in "${old[@]:-}"; do [[ -n "$d" ]] && rm -rf "$d"; done
+}
+
+op_restore_interactive() {
+    local dirs=() i dir choice
+    mapfile -t dirs < <(ls -1dt "$BACKUP_DIR"/*/ 2>/dev/null)
+    if (( ${#dirs[@]} == 0 )); then warn "Резервных копий нет."; return 0; fi
+
+    echo
+    hr
+    printf '%s                 ВОССТАНОВЛЕНИЕ%s\n' "$C_BLD" "$C_RST"
+    hr
+    for i in "${!dirs[@]}"; do printf '  %2d) %s\n' "$((i+1))" "$(basename "${dirs[$i]}")"; done
+    echo
+    ask choice "Номер копии (0 — отмена): " "0"
+    [[ "$choice" =~ ^[0-9]+$ ]] || { warn "Неверный ввод."; return 1; }
+    (( choice >= 1 && choice <= ${#dirs[@]} )) || { info "Отменено."; return 0; }
+    dir="${dirs[$((choice-1))]}"
+
+    [[ -f "$dir/state.json" ]] || { err "В копии нет state.json."; return 1; }
+    op_restore_from "$dir"
+}
+
+op_restore_from() {
+    local dir="$1"
+    ensure_base_dirs
+    op_backup >/dev/null 2>&1 || true
+    cp -p "$dir/state.json" "$STATE_FILE"
+    chmod 600 "$STATE_FILE"
+    info "Состояние восстановлено из $(basename "$dir")"
+
+    # убираем в mita пользователей, которых нет в восстановленном состоянии
+    mita_ensure_daemon >/dev/null 2>&1 || true
+    local desired current n
+    desired="$(state_get -r '.users[].name')"
+    current="$(mita_current_users)"
+    while IFS= read -r n; do
+        [[ -z "$n" ]] && continue
+        if ! grep -qxF "$n" <<<"$desired"; then
+            mita delete user "$n" >/dev/null 2>&1 || true
+            warn "Удалён из mita пользователь '$n' (нет в копии)."
+        fi
+    done <<<"$current"
+
+    if mita_hard_apply; then
+        info "Конфигурация применена, mita перезапущен."
+    else
+        warn "Не удалось применить конфигурацию."
+    fi
+    regenerate_all_links
+}
+
+# ---------------------------------------------------------------------------
+# Прочие операции
+# ---------------------------------------------------------------------------
+op_status() {
+    echo
+    hr
+    printf '%s                       СТАТУС%s\n' "$C_BLD" "$C_RST"
+    hr
+    [[ -f "$STATE_FILE" ]] && printf '  %-18s %s\n' "Файл состояния:" "$STATE_FILE" || warn "Файл состояния отсутствует."
+    printf '  %-18s %s\n' "Сервер:" "$(state_get -r '.serverAddress // "?"' 2>/dev/null)"
+    printf '  %-18s %s\n' "Пользователей:" "$(state_get -r '.users | length' 2>/dev/null || echo 0)"
+    printf '  %-18s %s\n' "Портов:" "$(state_get -r '.ports | length' 2>/dev/null || echo 0)"
+    printf '  %-18s %s\n' "mita:" "$(systemctl is-active mita 2>/dev/null || echo unknown)"
+    printf '  %-18s %s\n' "mita version:" "$(mita version 2>&1 | head -n1)"
+    hr
+    mita status 2>&1 | sed 's/^/  /' || true
+    hr
+    echo "  Трафик:"
+    mita get users 2>&1 | sed 's/^/  /' || true
+    hr
+}
+
+op_logs() {
+    info "Последние 60 строк журнала mita (Ctrl+C для выхода):"
+    hr
+    journalctl -u mita -n 60 --no-pager 2>/dev/null || warn "journalctl недоступен."
+    hr
+}
+
+op_update() {
+    local ver
+    ver="$(latest_mita_version)"
+    [[ -n "$ver" ]] || die "Не удалось получить последнюю версию."
+    download_and_install_mita "$ver"
+    rm -f "$MIERU_BIN"   # обновим и клиент для ссылок
+    if apply_server_config; then
+        mita stop >/dev/null 2>&1 || true
+        mita start >/dev/null 2>&1 || true
+    fi
+    regenerate_all_links
+    info "Обновление завершено."
+}
+
+op_show_config() {
+    echo
+    hr
+    printf '%s              КОНФИГУРАЦИЯ MITA%s\n' "$C_BLD" "$C_RST"
+    hr
+    mita describe config 2>&1 || true
+    hr
+    echo "  Наш файл: $SERVER_JSON"
+    echo "  (пароли mita не хранит — открытые пароли только в state.json)"
+}
+
+op_restart() {
+    mita_ensure_daemon >/dev/null 2>&1 || true
+    mita stop >/dev/null 2>&1 || true
+    apply_server_config || { err "Не удалось применить конфигурацию."; return 1; }
+    mita start >/dev/null 2>&1
+    sleep 1
+    if mita_proxy_running; then info "mita перезапущен и работает."; else warn "mita не запустился, смотрите логи."; fi
+}
+
+op_self_update() {
+    local tmp
+    tmp="$(mktemp)"
+    if curl -fsSL "$REPO_RAW/mieru-manager.sh" -o "$tmp"; then
+        install -m 0755 "$tmp" /usr/local/bin/mieru-manager 2>/dev/null \
+            || cp "$tmp" /usr/local/bin/mieru-manager
+        chmod 0755 /usr/local/bin/mieru-manager 2>/dev/null || true
+        rm -f "$tmp"
+        info "mieru-manager обновлён. Перезапустите его."
+    else
+        rm -f "$tmp"
+        err "Не удалось скачать обновление."
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Мастер первого запуска
+# ---------------------------------------------------------------------------
+first_run_wizard() {
+    hr
+    printf '%s          ПЕРВИЧНАЯ НАСТРОЙКА MIERU (mita)%s\n' "$C_BLD" "$C_RST"
+    hr
+    echo "  Сервер: $(state_get -r '.serverAddress')"
+    echo
+
+    # --- порты ---
+    local port proto choice more
+    echo "  Настроим порты, которые будет слушать mita."
+    echo "  Рекомендуется минимум один TCP и один UDP."
+    while :; do
+        ask port "  Порт (Enter — 443): " "443"
+        valid_port "$port" || { warn "  Некорректный порт."; continue; }
+        ask choice "  Протокол: 1) TCP  2) UDP  3) TCP+UDP  [1]: " "1"
+        case "$choice" in
+            1|"") state_update --argjson p "$port" '.ports += [{port:$p, protocol:"TCP"}]' && firewall_allow_port "$port" TCP ;;
+            2)     state_update --argjson p "$port" '.ports += [{port:$p, protocol:"UDP"}]' && firewall_allow_port "$port" UDP ;;
+            3)     state_update --argjson p "$port" '.ports += [{port:$p, protocol:"TCP"}]' && firewall_allow_port "$port" TCP
+                   state_update --argjson p "$port" '.ports += [{port:$p, protocol:"UDP"}]' && firewall_allow_port "$port" UDP ;;
+            *)     warn "  Неверный выбор."; continue ;;
+        esac
+        info "  Порт $port добавлен."
+        confirm "  Добавить ещё порт?" || break
+    done
+
+    # --- пользователи ---
+    echo
+    echo "  Теперь добавим пользователей (по одному)."
+    while :; do
+        local name pw pw2
+        while :; do
+            ask name "  Имя пользователя: " ""
+            [[ -z "$name" ]] && { warn "  Имя не может быть пустым."; continue; }
+            valid_user_name "$name" || { warn "  Недопустимое имя."; continue; }
+            break
+        done
+        ask_secret pw "  Пароль (Enter = сгенерировать): "
+        if [[ -z "$pw" ]]; then
+            pw="$(gen_password)"
+            info "  Сгенерирован пароль: ${C_BLD}${pw}${C_RST}"
+        else
+            ask_secret pw2 "  Повторите пароль: "
+            [[ "$pw" == "$pw2" ]] || { err "  Пароли не совпадают."; continue; }
+        fi
+        state_update --arg n "$name" --arg p "$pw" '.users += [{name:$n, password:$p}]' \
+            || { err "  Не удалось сохранить."; continue; }
+        info "  Пользователь '$name' добавлен."
+        confirm "  Добавить ещё пользователя?" || break
+    done
+
+    state_touch
+    if ! mita_hard_apply; then
+        warn "Не удалось применить конфигурацию. Проверьте вывод: mita describe config"
+        return 1
+    fi
+    info "Конфигурация применена, mita запущен."
+    regenerate_all_links
+}
+
+# ---------------------------------------------------------------------------
+# Установка
+# ---------------------------------------------------------------------------
+cmd_install() {
+    require_root install
+    ensure_base_dirs
+    state_init
+    install_deps
+
+    if ! command -v mita >/dev/null 2>&1; then
+        download_and_install_mita
+    else
+        info "mita уже установлен: $(mita version 2>&1 | head -n1)"
+        state_update --arg v "$(latest_mita_version)" '.mitaVersion = $v' >/dev/null 2>&1 || true
+        systemctl enable mita >/dev/null 2>&1 || true
+        systemctl start mita >/dev/null 2>&1 || true
+    fi
+
+    state_touch
+
+    local users ports
+    users="$(state_get -r '.users | length')"
+    ports="$(state_get -r '.ports | length')"
+
+    if (( users == 0 || ports == 0 )); then
+        if [[ "$HAS_TTY" -eq 1 ]]; then
+            first_run_wizard
+        else
+            warn "Нет пользователей/портов. Запустите 'mieru-manager' интерактивно."
+        fi
+    else
+        info "Найдена существующая конфигурация, применяю её."
+        mita_hard_apply || true
+        regenerate_all_links
+    fi
+
+    echo
+    hr
+    printf '%s                 УСТАНОВКА ЗАВЕРШЕНА%s\n' "$C_GRN$C_BLD" "$C_RST"
+    hr
+    echo "  Сервер:        $(state_get -r '.serverAddress')"
+    echo "  Пользователей: $(state_get -r '.users | length')"
+    echo "  Портов:        $(state_get -r '.ports | length')"
+    echo "  Состояние:     $STATE_FILE"
+    echo "  Ссылки:        $CLIENTS_DIR/"
+    echo
+    echo "  Управление:    mieru-manager"
+    hr
+}
+
+# ---------------------------------------------------------------------------
+# Меню
+# ---------------------------------------------------------------------------
+print_menu_header() {
+    local ip status users ports sc
+    ip="$(state_get -r '.serverAddress // "?"' 2>/dev/null || echo '?')"
+    users="$(state_get -r '.users | length' 2>/dev/null || echo 0)"
+    ports="$(state_get -r '.ports | length' 2>/dev/null || echo 0)"
+    if mita_proxy_running 2>/dev/null; then
+        status="● RUNNING"; sc="$C_GRN"
+    else
+        status="● IDLE/STOPPED"; sc="$C_YEL"
+    fi
+    echo
+    hr
+    printf '%s             MIERU MANAGER %s%s\n' "$C_BLD" "$APP_VERSION" "$C_RST"
+    hr
+    printf '  Сервер:  %s\n' "$ip"
+    printf '  Mita:    %s%s%s\n' "$sc" "$status" "$C_RST"
+    printf '  Юзеров:  %s\n' "$users"
+    printf '  Портов:  %s\n' "$ports"
+    hr
+}
+
+print_menu_items() {
+    cat <<'EOF'
+  1.  Добавить пользователя          9.  Показать все ссылки
+  2.  Удалить пользователя          10.  QR-код пользователя
+  3.  Изменить пароль               11.  Backup
+  4.  Список пользователей          12.  Восстановить backup
+  5.  Добавить порт                 13.  Обновить mita
+  6.  Удалить порт                  14.  Перезапустить mita
+  7.  Список портов                 15.  Статус
+  8.  Ссылка пользователя           16.  Логи
+                                    17.  Показать конфигурацию
+  0.  Выход                         18.  Обновить mieru-manager
+EOF
+}
+
+menu() {
+    require_root
+    while :; do
+        clear 2>/dev/null || true
+        print_menu_header
+        print_menu_items
+        echo
+        local choice u
+        ask choice "  Выберите действие [0-18]: " "0"
+        case "$choice" in
+            1)  op_add_user_interactive; pause ;;
+            2)  op_delete_user_interactive; pause ;;
+            3)  op_change_password_interactive; pause ;;
+            4)  op_list_users; pause ;;
+            5)  op_add_port_interactive; pause ;;
+            6)  op_delete_port_interactive; pause ;;
+            7)  op_list_ports; pause ;;
+            8)  ask u "  Имя пользователя: " ""; [[ -n "$u" ]] && op_show_links "$u"; pause ;;
+            9)  op_show_links; pause ;;
+            10) op_show_qr_interactive; pause ;;
+            11) op_backup; pause ;;
+            12) op_restore_interactive; pause ;;
+            13) op_update; pause ;;
+            14) op_restart; pause ;;
+            15) op_status; pause ;;
+            16) op_logs; pause ;;
+            17) op_show_config; pause ;;
+            18) op_self_update; pause ;;
+            0|q|Q) info "До выхода!"; exit 0 ;;
+            *)  warn "Неверный выбор."; sleep 1 ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+${APP_NAME} v${APP_VERSION} — управление прокси-сервером mita (mieru)
+
+Использование:
+  ${APP_NAME} [команда] [аргументы]
+
+Без аргументов открывает интерактивное меню (при первом запуске — установку).
+
+Команды:
+  install                     Установить/перенастроить mita
+  menu                        Интерактивное меню
+  status                      Статус сервера, службы и трафика
+  list-users                  Список пользователей
+  add-user <имя> [пароль]     Добавить пользователя (пароль можно не указывать)
+  delete-user <имя>           Удалить пользователя
+  passwd <имя> [пароль]       Сменить пароль
+  list-ports                  Список портов
+  add-port <порт> <tcp|udp|both>   Добавить порт
+  delete-port <порт>          Удалить порт
+  links [имя]                 Показать клиентские ссылки
+  qr <имя>                    Показать QR-код
+  config                      Показать конфигурацию mita
+  restart                     Перезапустить mita
+  backup                      Создать резервную копию
+  restore <каталог>           Восстановить из копии
+  update                      Обновить mita до последней версии
+  self-update                 Обновить сам ${APP_NAME}
+  logs                        Показать журнал mita
+  version                     Версия ${APP_NAME}
+  help                        Эта справка
+
+Файлы:
+  ${STATE_FILE}     состояние (пользователи, пароли, порты)
+  ${SERVER_JSON}    сгенерированный конфиг для mita
+  ${CLIENTS_DIR}/   клиентские ссылки и конфиги
+  ${BACKUP_DIR}/    резервные копии
+EOF
+}
+
+cmd_add_user_cli() {
+    local name="${1:-}" pw="${2:-}"
+    [[ -n "$name" ]] || die "Укажите имя: add-user <имя> [пароль]"
+    valid_user_name "$name" || die "Недопустимое имя пользователя."
+    state_get -e --arg n "$name" '.users[] | select(.name == $n)' 2>/dev/null | grep -q . \
+        && die "Пользователь '$name' уже существует."
+    [[ -z "$pw" ]] && pw="$(gen_password)"
+    (( ${#pw} <= 64 )) || die "Пароль длиннее 64 байт."
+    state_update --arg n "$name" --arg p "$pw" '.users += [{name:$n, password:$p}]' || die "Ошибка сохранения."
+    state_touch
+    mita_soft_apply || die "Не удалось применить конфигурацию."
+    info "Пользователь '$name' добавлен. Пароль: $pw"
+    save_user_links "$name"
+}
+
+cmd_delete_user_cli() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "Укажите имя: delete-user <имя>"
+    state_get -e --arg n "$name" '.users[] | select(.name == $n)' 2>/dev/null | grep -q . \
+        || die "Пользователь '$name' не найден."
+    mita_ensure_daemon >/dev/null 2>&1 || true
+    mita delete user "$name" >/dev/null 2>&1 || true
+    state_update --arg n "$name" '.users = [ .users[] | select(.name != $n) ]' || die "Ошибка сохранения."
+    state_touch
+    mita_proxy_running && mita reload >/dev/null 2>&1 || true
+    rm -f "$CLIENTS_DIR/$(sanitize_filename "$name").txt" "$CLIENTS_DIR/$(sanitize_filename "$name").json"
+    info "Пользователь '$name' удалён."
+}
+
+cmd_passwd_cli() {
+    local name="${1:-}" pw="${2:-}"
+    [[ -n "$name" ]] || die "Укажите имя: passwd <имя> [пароль]"
+    state_get -e --arg n "$name" '.users[] | select(.name == $n)' 2>/dev/null | grep -q . \
+        || die "Пользователь '$name' не найден."
+    [[ -z "$pw" ]] && pw="$(gen_password)"
+    (( ${#pw} <= 64 )) || die "Пароль длиннее 64 байт."
+    state_update --arg n "$name" --arg p "$pw" '(.users[] | select(.name == $n) | .password) = $p' \
+        || die "Ошибка сохранения."
+    state_touch
+    mita_soft_apply || die "Не удалось применить конфигурацию."
+    info "Пароль '$name' изменён на: $pw"
+    save_user_links "$name" >/dev/null
+}
+
+cmd_add_port_cli() {
+    local port="${1:-}" proto="${2:-tcp}"
+    valid_port "$port" || die "Укажите порт 1-65535: add-port <порт> <tcp|udp|both>"
+    local list=()
+    case "$(printf '%s' "$proto" | tr 'A-Z' 'a-z')" in
+        tcp)  list=(TCP) ;;
+        udp)  list=(UDP) ;;
+        both|all) list=(TCP UDP) ;;
+        *) die "Протокол: tcp, udp или both" ;;
+    esac
+    local p
+    for p in "${list[@]}"; do
+        state_get -e --argjson pp "$port" --arg t "$p" '.ports[] | select(.port == $pp and .protocol == $t)' 2>/dev/null | grep -q . \
+            && { warn "Порт ${port}/${p} уже есть."; continue; }
+        state_update --argjson pp "$port" --arg t "$p" '.ports += [{port:$pp, protocol:$t}]' || die "Ошибка сохранения."
+        firewall_allow_port "$port" "$p"
+    done
+    state_touch
+    try_hard_apply || die "Не удалось перезапустить mita."
+    regenerate_all_links
+    info "Порт ${port} (${proto}) добавлен."
+}
+
+cmd_delete_port_cli() {
+    local port="${1:-}"
+    valid_port "$port" || die "Укажите порт: delete-port <порт>"
+    local items; items="$(state_get -r --argjson p "$port" '.ports[] | select(.port == $p) | .protocol')"
+    [[ -z "$items" ]] && die "Порт $port не найден."
+    local t
+    while IFS= read -r t; do
+        [[ -z "$t" ]] && continue
+        state_update --argjson p "$port" --arg tt "$t" '.ports = [ .ports[] | select(.port != $p or .protocol != $tt) ]' || die "Ошибка."
+        firewall_deny_port "$port" "$t"
+    done <<<"$items"
+    state_touch
+    try_hard_apply || die "Не удалось перезапустить mita."
+    regenerate_all_links
+    info "Порт $port удалён."
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+main() {
+    local cmd="${1:-}"
+    case "$cmd" in
+        "" )
+            if ! command -v mita >/dev/null 2>&1 || ! state_exists; then
+                cmd_install
+            fi
+            if [[ "$HAS_TTY" -eq 1 ]]; then
+                menu
+            else
+                usage
+            fi
+            ;;
+        install)      cmd_install ;;
+        menu)         menu ;;
+        status)       require_root; op_status ;;
+        list-users)   require_root; op_list_users ;;
+        add-user)     require_root; shift; cmd_add_user_cli "$@" ;;
+        delete-user)  require_root; shift; cmd_delete_user_cli "$@" ;;
+        passwd)       require_root; shift; cmd_passwd_cli "$@" ;;
+        list-ports)   require_root; op_list_ports ;;
+        add-port)     require_root; shift; cmd_add_port_cli "$@" ;;
+        delete-port)  require_root; shift; cmd_delete_port_cli "$@" ;;
+        links)        require_root; shift; op_show_links "${1:-}" ;;
+        qr)           require_root; shift; [[ -n "${1:-}" ]] || die "Укажите имя: qr <имя>"; op_show_qr_user "${1}" ;;
+        config)       require_root; op_show_config ;;
+        restart)      require_root; op_restart ;;
+        backup)       require_root; op_backup ;;
+        restore)      require_root; shift; [[ -n "${1:-}" ]] || die "Укажите каталог: restore <каталог>"; op_restore_from "${1}" ;;
+        update)       require_root; op_update ;;
+        self-update)  require_root; op_self_update ;;
+        logs)         require_root; op_logs ;;
+        version)      printf '%s v%s\n' "$APP_NAME" "$APP_VERSION" ;;
+        help|-h|--help) usage ;;
+        *)            err "Неизвестная команда: $cmd"; echo; usage; exit 1 ;;
+    esac
+}
+
+# QR для конкретного пользователя без интерактивного выбора
+op_show_qr_user() {
+    local name="$1" out std simple link
+    state_get -e --arg n "$name" '.users[] | select(.name == $n)' 2>/dev/null | grep -q . \
+        || die "Пользователь '$name' не найден."
+    out="$(generate_user_links "$name")" || die "Не удалось получить ссылку."
+    std="$(printf '%s\n' "$out" | sed -n 's/^STANDARD=//p')"
+    simple="$(printf '%s\n' "$out" | sed -n 's/^SIMPLE=//p')"
+    link="${std:-$simple}"
+    [[ -z "$link" ]] && die "Ссылка пуста."
+    printf '%s%s%s\n\n' "$C_BLD" "$name" "$C_RST"
+    command -v qrencode >/dev/null 2>&1 && qrencode -t ANSIUTF8 "$link" || warn "qrencode не установлен."
+    echo
+    printf '%s\n' "$link"
+}
+
+main "$@"
